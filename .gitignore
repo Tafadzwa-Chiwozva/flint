@@ -1,0 +1,21 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Local model weights and tokenizer downloads (large; fetch separately)
+/models
+*.safetensors
+
+# Python
+.venv
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Bench outputs
+/results
+/bench-results
+
+# Editor / OS
+.DS_Store
+*.swp
