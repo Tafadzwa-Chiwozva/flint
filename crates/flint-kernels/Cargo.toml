@@ -1,0 +1,20 @@
+[package]
+name = "flint-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "CPU math kernels and CUDA scaffolding for Flint"
+readme = "../../README.md"
+
+[features]
+default = []
+# Compiles the CUDA translation units with nvcc and links cudart.
+# The CPU forward pass does not call these kernels in phase 1.
+cuda = []
+
+[dependencies]
+
+[dev-dependencies]
+rand = { workspace = true }

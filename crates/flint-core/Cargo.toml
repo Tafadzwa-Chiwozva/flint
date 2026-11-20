@@ -1,0 +1,22 @@
+[package]
+name = "flint-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Qwen2/Llama forward pass, sampling, and weight loading for Flint"
+readme = "../../README.md"
+
+[dependencies]
+flint-kernels = { workspace = true }
+flint-kv = { workspace = true }
+half = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+safetensors = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokenizers = { workspace = true }
+tracing = { workspace = true }
