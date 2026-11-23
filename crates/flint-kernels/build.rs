@@ -1,14 +1,17 @@
-//! Builds the CUDA translation units when the `cuda` feature is enabled.
+//! Builds CUDA PTX when the `cuda` feature is enabled.
 //!
 //! With the feature off this script is a no-op, so a machine without the CUDA
-//! toolkit can build, test, and serve the CPU engine.
+//! toolkit can build, test, and serve the CPU engine. With the feature on,
+//! `nvcc -ptx` compiles `kernels/ops.cu`. The PTX is compiled into the crate
+//! and loaded with the driver API at runtime, so this step does not link
+//! `libcudart` and does not need a GPU.
 
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=kernels/rms_norm.cu");
-    println!("cargo:rerun-if-changed=kernels/paged_attention.cu");
+    println!("cargo:rerun-if-changed=kernels/ops.cu");
     println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
@@ -17,69 +20,58 @@ fn main() {
         return;
     }
 
-    if let Err(err) = compile_cuda() {
+    if let Err(err) = compile_ptx() {
         panic!("flint-kernels cuda feature is enabled but the CUDA build failed: {err}");
     }
 }
 
-fn compile_cuda() -> Result<(), String> {
+fn compile_ptx() -> Result<(), String> {
     let nvcc = std::env::var("NVCC").unwrap_or_else(|_| "nvcc".into());
     let out_dir = std::env::var("OUT_DIR").map_err(|err| err.to_string())?;
-    let cuda_home = std::env::var("CUDA_HOME")
-        .or_else(|_| std::env::var("CUDA_PATH"))
-        .unwrap_or_else(|_| "/usr/local/cuda".into());
+    let src = "kernels/ops.cu";
+    if !Path::new(src).exists() {
+        return Err(format!("missing {src}"));
+    }
 
-    let version = std::process::Command::new(&nvcc)
+    let version = Command::new(&nvcc)
         .arg("--version")
-        .status()
+        .output()
         .map_err(|err| {
-            format!("could not run `{nvcc}` ({err}). Install the CUDA toolkit or unset the cuda feature.")
+            format!(
+                "could not run `{nvcc}` ({err}). Install the CUDA toolkit (nvcc) or build without `--features cuda`."
+            )
         })?;
-    if !version.success() {
-        return Err(format!("`{nvcc} --version` failed"));
+    if !version.status.success() {
+        return Err(format!(
+            "`{nvcc} --version` failed:\n{}",
+            String::from_utf8_lossy(&version.stderr)
+        ));
     }
 
-    let sources = ["kernels/rms_norm.cu", "kernels/paged_attention.cu"];
-    let mut objects = Vec::with_capacity(sources.len());
-    for src in sources {
-        let stem = Path::new(src)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| format!("bad source path {src}"))?;
-        let obj = format!("{out_dir}/{stem}.o");
-        let status = std::process::Command::new(&nvcc)
-            .args([
-                "-O3",
-                "-std=c++17",
-                "--compiler-options",
-                "-fPIC",
-                "-c",
-                src,
-                "-o",
-                &obj,
-            ])
-            .status()
-            .map_err(|err| err.to_string())?;
-        if !status.success() {
-            return Err(format!("nvcc failed while compiling {src}"));
-        }
-        objects.push(obj);
+    let ptx_path = format!("{out_dir}/flint.ptx");
+    // compute_75 PTX JIT-compiles on Turing and everything newer (4090, A100, H100).
+    let output = Command::new(&nvcc)
+        .args([
+            "-ptx",
+            "-O3",
+            "-std=c++17",
+            "-arch=compute_75",
+            src,
+            "-o",
+            &ptx_path,
+        ])
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "nvcc failed while compiling {src}:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
-
-    let lib = format!("{out_dir}/libflint_kernels.a");
-    let mut ar = std::process::Command::new("ar");
-    ar.arg("rcs").arg(&lib);
-    for obj in &objects {
-        ar.arg(obj);
+    let written = std::fs::read(&ptx_path).map_err(|err| err.to_string())?;
+    if written.is_empty() {
+        return Err(format!("nvcc wrote an empty {ptx_path}"));
     }
-    let status = ar.status().map_err(|err| format!("ar failed: {err}"))?;
-    if !status.success() {
-        return Err("ar failed while packing libflint_kernels.a".into());
-    }
-
-    println!("cargo:rustc-link-search=native={out_dir}");
-    println!("cargo:rustc-link-lib=static=flint_kernels");
-    println!("cargo:rustc-link-search=native={cuda_home}/lib64");
-    println!("cargo:rustc-link-lib=dylib=cudart");
     Ok(())
 }

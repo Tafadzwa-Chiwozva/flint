@@ -10,11 +10,36 @@ use flint_core::{
 };
 use hf_hub::api::sync::Api;
 
-use crate::engine::{spawn, EngineEvent, FinishReason, TextCodec};
+use crate::engine::{into_engine_model, spawn, EngineEvent, ExecDevice, FinishReason, TextCodec};
 use crate::http::{router, AppState};
 use crate::serve_runtime;
 
 /// Byte-level codec for `flint --dummy`. Vocabulary is the 256 byte values.
+/// Where the forward pass runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum DeviceKind {
+    /// Host reference path. This is the default.
+    Cpu,
+    /// CUDA weights, cuBLAS GEMMs, and paged attention. Needs `--features cuda`.
+    Cuda,
+}
+
+impl DeviceKind {
+    fn exec(self) -> ExecDevice {
+        match self {
+            Self::Cpu => ExecDevice::Cpu,
+            Self::Cuda => ExecDevice::Cuda,
+        }
+    }
+}
+
+fn require_device(device: DeviceKind) -> anyhow::Result<()> {
+    if device == DeviceKind::Cuda && !cfg!(feature = "cuda") {
+        anyhow::bail!("--device cuda requires rebuilding flint with `--features cuda`");
+    }
+    Ok(())
+}
+
 struct ByteCodec;
 
 impl TextCodec for ByteCodec {
@@ -78,6 +103,9 @@ struct ModelArgs {
     /// Serve a tiny random model with a byte-level codec. No download.
     #[arg(long)]
     dummy: bool,
+    /// Execution device. `cpu` is the default.
+    #[arg(long, value_enum, default_value = "cpu")]
+    device: DeviceKind,
 }
 
 #[derive(Parser)]
@@ -182,11 +210,14 @@ pub async fn cli() -> anyhow::Result<()> {
 }
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    require_device(args.model.device)?;
     let (model, codec, model_name) = load_pair(&args.model)?;
     let num_blocks = args.num_blocks;
     let block_size = args.block_size;
+    let model = into_engine_model(model, args.model.device.exec(), num_blocks, block_size)?;
+    tracing::info!(device = ?args.model.device, "forward device");
     let (engine, thread) = spawn(
-        Box::new(model),
+        model,
         Arc::clone(&codec),
         num_blocks,
         block_size,
@@ -221,7 +252,14 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 }
 
 async fn generate(args: GenerateArgs) -> anyhow::Result<()> {
+    require_device(args.model.device)?;
     let (model, codec, _) = load_pair(&args.model)?;
+    let model = into_engine_model(
+        model,
+        args.model.device.exec(),
+        args.num_blocks,
+        args.block_size,
+    )?;
     let prompt = match (&args.prompt, &args.chat) {
         (Some(prompt), None) => prompt.clone(),
         (None, Some(chat)) => apply_qwen_chat_template(&[ChatTurn {
@@ -239,7 +277,7 @@ async fn generate(args: GenerateArgs) -> anyhow::Result<()> {
     };
     sampling.validate()?;
     let (engine, _thread) = spawn(
-        Box::new(model),
+        model,
         Arc::clone(&codec),
         args.num_blocks,
         args.block_size,
@@ -303,16 +341,27 @@ fn logits(args: LogitsArgs) -> anyhow::Result<()> {
     if args.model.dummy {
         anyhow::bail!("--dummy has no checkpoint to score; use generate");
     }
+    require_device(args.model.device)?;
     let dir = resolve_dir(&args.model)?;
-    let mut model = Model::load(&dir)?;
+    let model = Model::load(&dir)?;
     let tokenizer = FlintTokenizer::open(&dir)?;
+    let encoded: Vec<(String, Vec<u32>)> = args
+        .prompt
+        .iter()
+        .map(|prompt| {
+            let token_ids = tokenizer.encode(prompt)?;
+            Ok((prompt.clone(), token_ids))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
     let mut rows = Vec::new();
-    for prompt in &args.prompt {
-        let token_ids = tokenizer.encode(prompt)?;
-        let output = model.forward_prompt(&token_ids, args.block_size)?;
-        let logits = output
-            .logits
-            .context("forward pass did not return logits")?;
+    let scored = score_prompts(&args, model, &encoded)?;
+    for ScoredPrompt {
+        prompt,
+        token_ids,
+        logits,
+        last_hidden,
+    } in scored
+    {
         let argmax = logits
             .iter()
             .enumerate()
@@ -329,7 +378,7 @@ fn logits(args: LogitsArgs) -> anyhow::Result<()> {
             "token_ids": token_ids,
             "argmax": argmax,
             "logits": logits,
-            "last_hidden": output.last_hidden,
+            "last_hidden": last_hidden,
         }));
     }
     let text = serde_json::to_string(&rows)?;
@@ -339,6 +388,73 @@ fn logits(args: LogitsArgs) -> anyhow::Result<()> {
         println!("{text}");
     }
     Ok(())
+}
+
+struct ScoredPrompt {
+    prompt: String,
+    token_ids: Vec<u32>,
+    logits: Vec<f32>,
+    last_hidden: Option<Vec<f32>>,
+}
+
+fn score_prompts(
+    args: &LogitsArgs,
+    mut model: Model,
+    encoded: &[(String, Vec<u32>)],
+) -> anyhow::Result<Vec<ScoredPrompt>> {
+    match args.model.device {
+        DeviceKind::Cpu => {
+            let mut rows = Vec::new();
+            for (prompt, token_ids) in encoded {
+                let output = model.forward_prompt(token_ids, args.block_size)?;
+                let logits = output
+                    .logits
+                    .context("forward pass did not return logits")?;
+                rows.push(ScoredPrompt {
+                    prompt: prompt.clone(),
+                    token_ids: token_ids.clone(),
+                    logits,
+                    last_hidden: output.last_hidden,
+                });
+            }
+            Ok(rows)
+        }
+        DeviceKind::Cuda => score_cuda(args, model, encoded),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn score_cuda(
+    args: &LogitsArgs,
+    model: Model,
+    encoded: &[(String, Vec<u32>)],
+) -> anyhow::Result<Vec<ScoredPrompt>> {
+    let max_len = encoded.iter().map(|(_, ids)| ids.len()).max().unwrap_or(1);
+    let n_blocks = max_len.div_ceil(args.block_size).max(1);
+    let mut gpu = model.into_gpu(n_blocks, args.block_size)?;
+    let mut rows = Vec::new();
+    for (prompt, token_ids) in encoded {
+        let output = gpu.forward_prompt(token_ids)?;
+        let logits = output
+            .logits
+            .context("forward pass did not return logits")?;
+        rows.push(ScoredPrompt {
+            prompt: prompt.clone(),
+            token_ids: token_ids.clone(),
+            logits,
+            last_hidden: output.last_hidden,
+        });
+    }
+    Ok(rows)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn score_cuda(
+    _args: &LogitsArgs,
+    _model: Model,
+    _encoded: &[(String, Vec<u32>)],
+) -> anyhow::Result<Vec<ScoredPrompt>> {
+    anyhow::bail!("--device cuda requires rebuilding flint with `--features cuda`")
 }
 
 fn load_pair(args: &ModelArgs) -> anyhow::Result<(Model, Arc<dyn TextCodec>, String)> {

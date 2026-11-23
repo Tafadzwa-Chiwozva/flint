@@ -1,17 +1,15 @@
-//! CPU kernels used by the reference forward pass, plus CUDA launch scaffolding.
+//! CPU kernels used by the reference forward pass, plus the CUDA device runtime.
 //!
-//! Phase 1 ships two kernels that the model actually calls:
+//! The CPU path calls two kernels:
 //!
 //! * [`rms_norm`] — row-wise RMSNorm used before attention, before the MLP, and
 //!   before the LM head.
 //! * [`paged_attention`] — grouped-query attention that reads K and V through a
 //!   block table instead of a contiguous cache.
 //!
-//! The same physical layout is what the CUDA stubs in `kernels/*.cu` expect.
-//! Enabling the `cuda` feature compiles those translation units; the CPU path
-//! does not call them. See the crate README section in the repository README
-//! for the phase-2 kernel plan (online softmax, vectorized loads, one warp
-//! per query head).
+//! With `--features cuda`, `kernels/ops.cu` is compiled to PTX and the `cuda`
+//! module loads it. That module also owns the cuBLAS GEMM. The CPU functions
+//! stay the oracle; the GPU path is selected at runtime with `--device cuda`.
 
 #![deny(missing_docs)]
 
@@ -34,8 +32,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cuda_feature_is_off_by_default() {
-        assert!(!cuda_compiled());
+    fn cuda_feature_matches_this_build() {
+        assert_eq!(cuda_compiled(), cfg!(feature = "cuda"));
     }
 
     #[test]

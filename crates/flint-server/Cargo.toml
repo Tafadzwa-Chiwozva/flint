@@ -12,6 +12,10 @@ readme = "../../README.md"
 name = "flint"
 path = "src/main.rs"
 
+[features]
+default = []
+cuda = ["flint-core/cuda"]
+
 [dependencies]
 flint-core = { workspace = true }
 flint-kv = { workspace = true }

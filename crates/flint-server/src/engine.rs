@@ -3,9 +3,9 @@
 //! HTTP handlers submit prompts over a bounded channel and read token events
 //! back. The engine thread is the only thing that touches the model and the
 //! KV cache, so the forward pass stays synchronous and the scheduler stays
-//! race-free. On CPU each sequence in an iteration is executed one after
-//! another; the iteration is still planned as a batch so the same scheduler
-//! can drive a fused GPU kernel later.
+//! race-free. The CPU model runs each sequence in an iteration one after
+//! another. A model that opts into [`LanguageModel::uses_batched_forward`]
+//! receives the whole iteration in one call.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,9 +16,9 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use flint_core::{sample, ChatTurn, Error, Model, SamplingParams};
+use flint_core::{sample, ChatTurn, Error, ForwardChunk, Model, SamplingParams};
 use flint_kv::PagedKvCache;
-use flint_schedule::{PushOutcome, Scheduler, SchedulerConfig};
+use flint_schedule::{PushOutcome, Scheduler, SchedulerConfig, WorkItem};
 use rand::rngs::StdRng;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -118,6 +118,33 @@ pub(crate) trait LanguageModel: Send {
         want_logits: bool,
     ) -> Result<Option<Vec<f32>>, Error>;
 
+    /// When true, the engine calls [`Self::forward_batch`] once per scheduler step.
+    fn uses_batched_forward(&self) -> bool {
+        false
+    }
+
+    /// Run every chunk in this scheduler step.
+    ///
+    /// The default walks [`Self::forward_chunk`]. The CUDA model replaces it
+    /// with one batched GEMM and one paged-attention launch per layer.
+    fn forward_batch(
+        &mut self,
+        items: &[ForwardChunk<'_>],
+        cache: &mut PagedKvCache,
+    ) -> Result<Vec<Option<Vec<f32>>>, Error> {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            out.push(self.forward_chunk(
+                item.tokens,
+                item.position,
+                cache,
+                item.block_table,
+                item.want_logits,
+            )?);
+        }
+        Ok(out)
+    }
+
     /// Vocabulary width of the logit vector.
     fn vocab_size(&self) -> usize;
     /// Transformer layers.
@@ -162,6 +189,99 @@ impl LanguageModel for Model {
 
     fn eos_token_ids(&self) -> &[u32] {
         Model::eos_token_ids(self)
+    }
+}
+
+/// Where the forward pass runs. `Cuda` requires the `cuda` crate feature and a GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecDevice {
+    /// Host reference forward pass.
+    Cpu,
+    /// Device weights, cuBLAS, and the paged CUDA kernels.
+    Cuda,
+}
+
+/// Box the loaded model for the engine thread.
+pub(crate) fn into_engine_model(
+    model: Model,
+    device: ExecDevice,
+    num_blocks: usize,
+    block_size: usize,
+) -> Result<Box<dyn LanguageModel>, Error> {
+    match device {
+        ExecDevice::Cpu => Ok(Box::new(model)),
+        ExecDevice::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                let gpu = model.into_gpu(num_blocks, block_size)?;
+                Ok(Box::new(CudaModel { inner: gpu }))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (model, num_blocks, block_size);
+                Err(Error::Inference(
+                    "--device cuda requires rebuilding flint with `--features cuda`".into(),
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct CudaModel {
+    inner: flint_core::GpuModel,
+}
+
+#[cfg(feature = "cuda")]
+impl LanguageModel for CudaModel {
+    fn uses_batched_forward(&self) -> bool {
+        true
+    }
+
+    fn forward_chunk(
+        &mut self,
+        tokens: &[u32],
+        position: usize,
+        cache: &mut PagedKvCache,
+        block_table: &[u32],
+        want_logits: bool,
+    ) -> Result<Option<Vec<f32>>, Error> {
+        let item = [ForwardChunk {
+            tokens,
+            position,
+            block_table,
+            want_logits,
+        }];
+        let mut rows = self.forward_batch(&item, cache)?;
+        Ok(rows.pop().flatten())
+    }
+
+    fn forward_batch(
+        &mut self,
+        items: &[ForwardChunk<'_>],
+        _cache: &mut PagedKvCache,
+    ) -> Result<Vec<Option<Vec<f32>>>, Error> {
+        self.inner.forward_batch(items)
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    fn num_layers(&self) -> usize {
+        self.inner.num_layers()
+    }
+
+    fn num_kv_heads(&self) -> usize {
+        self.inner.num_kv_heads()
+    }
+
+    fn head_dim(&self) -> usize {
+        self.inner.head_dim()
+    }
+
+    fn eos_token_ids(&self) -> &[u32] {
+        self.inner.eos_token_ids()
     }
 }
 
@@ -264,55 +384,26 @@ fn engine_loop(
             tracing::debug!(ids = ?step.preempted, "preempted sequences");
         }
 
-        for item in step.items {
-            if cancelled(&live, item.request_id) {
-                drop_request(&mut scheduler, &mut live, item.request_id, None);
-                continue;
-            }
-            let logits = match model.forward_chunk(
-                &item.tokens,
-                item.position,
+        if model.uses_batched_forward() {
+            execute_batch(
+                &mut *model,
+                &mut scheduler,
                 &mut cache,
-                &item.block_table,
-                item.sample_after,
-            ) {
-                Ok(logits) => logits,
-                Err(err) => {
-                    drop_request(
-                        &mut scheduler,
-                        &mut live,
-                        item.request_id,
-                        Some(err.to_string()),
-                    );
-                    continue;
-                }
-            };
-            if let Err(err) = scheduler.mark_computed(item.request_id, item.tokens.len()) {
-                drop_request(
+                &mut live,
+                codec.as_ref(),
+                &eos,
+                step.items,
+            );
+        } else {
+            for item in step.items {
+                execute_one(
+                    &mut *model,
                     &mut scheduler,
-                    &mut live,
-                    item.request_id,
-                    Some(err.to_string()),
-                );
-                continue;
-            }
-            if item.sample_after {
-                let Some(logits) = logits else {
-                    drop_request(
-                        &mut scheduler,
-                        &mut live,
-                        item.request_id,
-                        Some("forward pass returned no logits".into()),
-                    );
-                    continue;
-                };
-                sample_and_emit(
-                    &mut scheduler,
+                    &mut cache,
                     &mut live,
                     codec.as_ref(),
                     &eos,
-                    item.request_id,
-                    &logits,
+                    item,
                 );
             }
         }
@@ -324,6 +415,118 @@ fn engine_loop(
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
+    }
+}
+
+fn execute_one(
+    model: &mut dyn LanguageModel,
+    scheduler: &mut Scheduler,
+    cache: &mut PagedKvCache,
+    live: &mut HashMap<u64, Live>,
+    codec: &dyn TextCodec,
+    eos: &[u32],
+    item: WorkItem,
+) {
+    if cancelled(live, item.request_id) {
+        drop_request(scheduler, live, item.request_id, None);
+        return;
+    }
+    let logits = match model.forward_chunk(
+        &item.tokens,
+        item.position,
+        cache,
+        &item.block_table,
+        item.sample_after,
+    ) {
+        Ok(logits) => logits,
+        Err(err) => {
+            drop_request(scheduler, live, item.request_id, Some(err.to_string()));
+            return;
+        }
+    };
+    apply_step(scheduler, live, codec, eos, item, logits);
+}
+
+fn execute_batch(
+    model: &mut dyn LanguageModel,
+    scheduler: &mut Scheduler,
+    cache: &mut PagedKvCache,
+    live: &mut HashMap<u64, Live>,
+    codec: &dyn TextCodec,
+    eos: &[u32],
+    items: Vec<WorkItem>,
+) {
+    let mut kept = Vec::new();
+    for item in items {
+        if cancelled(live, item.request_id) {
+            drop_request(scheduler, live, item.request_id, None);
+            continue;
+        }
+        kept.push(item);
+    }
+    if kept.is_empty() {
+        return;
+    }
+    let logits = {
+        let reqs: Vec<ForwardChunk<'_>> = kept
+            .iter()
+            .map(|item| ForwardChunk {
+                tokens: &item.tokens,
+                position: item.position,
+                block_table: &item.block_table,
+                want_logits: item.sample_after,
+            })
+            .collect();
+        match model.forward_batch(&reqs, cache) {
+            Ok(rows) => rows,
+            Err(err) => {
+                let message = err.to_string();
+                for item in kept {
+                    drop_request(scheduler, live, item.request_id, Some(message.clone()));
+                }
+                return;
+            }
+        }
+    };
+    if logits.len() != kept.len() {
+        for item in kept {
+            drop_request(
+                scheduler,
+                live,
+                item.request_id,
+                Some("batched forward returned the wrong number of rows".into()),
+            );
+        }
+        return;
+    }
+    for (item, row) in kept.into_iter().zip(logits) {
+        apply_step(scheduler, live, codec, eos, item, row);
+    }
+}
+
+fn apply_step(
+    scheduler: &mut Scheduler,
+    live: &mut HashMap<u64, Live>,
+    codec: &dyn TextCodec,
+    eos: &[u32],
+    item: WorkItem,
+    logits: Option<Vec<f32>>,
+) {
+    if let Err(err) = scheduler.mark_computed(item.request_id, item.tokens.len()) {
+        drop_request(scheduler, live, item.request_id, Some(err.to_string()));
+        return;
+    }
+    if item.sample_after {
+        let Some(logits) = logits else {
+            drop_request(
+                scheduler,
+                live,
+                item.request_id,
+                Some("forward pass returned no logits".into()),
+            );
+            return;
+        };
+        sample_and_emit(scheduler, live, codec, eos, item.request_id, &logits);
     }
 }
 
@@ -516,5 +719,170 @@ fn push_sampled(
             live.remove(&id);
         }
         Err(err) => drop_request(scheduler, live, id, Some(err.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    struct IdCodec;
+
+    impl TextCodec for IdCodec {
+        fn encode(&self, text: &str) -> Result<Vec<u32>, Error> {
+            Ok(text.bytes().map(|byte| byte as u32).collect())
+        }
+
+        fn decode(&self, ids: &[u32]) -> Result<String, Error> {
+            Ok(ids
+                .iter()
+                .map(|id| char::from_u32(*id).unwrap_or('?'))
+                .collect())
+        }
+
+        fn apply_chat_template(&self, messages: &[ChatTurn]) -> Result<String, Error> {
+            Ok(messages
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>()
+                .join(""))
+        }
+    }
+
+    struct Gate {
+        hold_first: AtomicBool,
+        entered: AtomicBool,
+        release: AtomicBool,
+        sizes: Mutex<Vec<usize>>,
+    }
+
+    struct Probe {
+        gate: Arc<Gate>,
+    }
+
+    impl LanguageModel for Probe {
+        fn uses_batched_forward(&self) -> bool {
+            true
+        }
+
+        fn forward_chunk(
+            &mut self,
+            _tokens: &[u32],
+            _position: usize,
+            _cache: &mut PagedKvCache,
+            _block_table: &[u32],
+            _want_logits: bool,
+        ) -> Result<Option<Vec<f32>>, Error> {
+            panic!("batched model was invoked one sequence at a time");
+        }
+
+        fn forward_batch(
+            &mut self,
+            items: &[ForwardChunk<'_>],
+            _cache: &mut PagedKvCache,
+        ) -> Result<Vec<Option<Vec<f32>>>, Error> {
+            if self
+                .gate
+                .hold_first
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                self.gate
+                    .entered
+                    .store(true, std::sync::atomic::Ordering::Release);
+                while !self.gate.release.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            }
+            self.gate.sizes.lock().expect("sizes").push(items.len());
+            Ok(items
+                .iter()
+                .map(|item| {
+                    if item.want_logits {
+                        Some(vec![0.0; 32])
+                    } else {
+                        None
+                    }
+                })
+                .collect())
+        }
+
+        fn vocab_size(&self) -> usize {
+            32
+        }
+        fn num_layers(&self) -> usize {
+            1
+        }
+        fn num_kv_heads(&self) -> usize {
+            1
+        }
+        fn head_dim(&self) -> usize {
+            4
+        }
+        fn eos_token_ids(&self) -> &[u32] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn batched_forward_covers_every_sequence_in_the_step() {
+        let gate = Arc::new(Gate {
+            hold_first: AtomicBool::new(true),
+            entered: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+            sizes: Mutex::new(Vec::new()),
+        });
+        let model = Box::new(Probe {
+            gate: Arc::clone(&gate),
+        });
+        let (engine, thread) = spawn(
+            model,
+            Arc::new(IdCodec),
+            16,
+            4,
+            SchedulerConfig {
+                max_num_seqs: 4,
+                max_batched_tokens: 64,
+                prefill_chunk_size: 16,
+                max_waiting: 8,
+            },
+        )
+        .unwrap();
+        let _first = engine
+            .submit(vec![1, 2], SamplingParams::greedy(), 4, Vec::new())
+            .unwrap();
+        let start = Instant::now();
+        while !gate.entered.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "engine did not enter the first batched forward"
+            );
+            std::thread::yield_now();
+        }
+        let _second = engine
+            .submit(vec![3, 4], SamplingParams::greedy(), 4, Vec::new())
+            .unwrap();
+        gate.release
+            .store(true, std::sync::atomic::Ordering::Release);
+        while !gate
+            .sizes
+            .lock()
+            .expect("sizes")
+            .iter()
+            .any(|size| *size >= 2)
+        {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "scheduler step never forwarded two sequences together: {:?}",
+                gate.sizes.lock().unwrap()
+            );
+            std::thread::yield_now();
+        }
+        drop(_first);
+        drop(_second);
+        drop(engine);
+        thread.join().unwrap();
     }
 }
