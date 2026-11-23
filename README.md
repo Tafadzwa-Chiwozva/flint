@@ -34,7 +34,7 @@ flowchart TB
 
 | Crate | Job |
 | --- | --- |
-| `flint-kernels` | RMSNorm and paged GQA attention. CUDA sources live next to the CPU kernels and build only with `--features cuda`. |
+| `flint-kernels` | RMSNorm and paged GQA attention. `--features cuda` compiles `kernels/ops.cu` to PTX and loads the driver and cuBLAS at runtime. |
 | `flint-kv` | Block allocator (fixed-size pages, per-sequence block tables, refcounts, copy-on-write) and the K/V arrays those ids address. |
 | `flint-core` | Safetensors loader, Hugging Face tokenizer, hand-written GEMM, Qwen2 forward pass, sampling. |
 | `flint-schedule` | Pure iteration scheduler. It never calls the model, so the policy is unit-tested without weights. |
@@ -84,7 +84,7 @@ Each iteration, in order:
 3. Admit waiting requests FCFS, but only while `max_num_seqs` allows it and the **entire current token list** fits in free blocks. The head of the queue is not skipped, so a long prompt cannot be starved by a stream of short ones.
 4. Build the iteration. Decode steps (one new token on a sequence that has finished prefill) run before prefills, inside `max_batched_tokens`. Prefills are cut into `prefill_chunk_size`. `sample_after` is set only when the chunk reaches the last stored token, so a partial prefill does not pay for the vocabulary projection.
 
-On CPU the engine then runs those work items one sequence at a time. The iteration is still a batch from the scheduler's point of view. A GPU phase can replace the loop with one batched GEMM and one paged-attention launch without changing admission.
+On CPU the engine then runs those work items one sequence at a time. The iteration is still a batch from the scheduler's point of view. With `--device cuda` the same step is one batched forward: GEMMs see every token in the step, and attention is one decode launch plus a prefill launch per multi-token sequence.
 
 The HTTP server submits prompts on a bounded channel. One engine thread owns the model, the scheduler, and the cache. Cancelling a stream sets a flag and drops the event channel; the engine frees the sequence's blocks instead of sampling into a disconnected client. Stop strings are withheld from SSE until they cannot still grow into a match (`max_stop_len - 1` characters), which is the OpenAI behavior of not emitting the stop sequence.
 
@@ -199,19 +199,53 @@ Inter-token latency is the gap between SSE events that carry text. At concurrenc
 - Preemption recomputes. It does not swap KV to a side buffer.
 - Block refcounts and copy-on-write are ready for prefix sharing. The scheduler does not use them yet.
 - Weights are widened to f32. There is no on-the-fly bf16 GEMM, and no 4-bit or 8-bit matmul.
-- The CUDA kernels are compiled only with `--features cuda` and are not called by the forward pass.
+- `--device cuda` (see Phase 2) is off unless the binary is built with `--features cuda`. The default build and the default CI job stay CPU-only.
 - No speculative decoding, no repetition penalty, no tool calls. `n` other than 1 is rejected; concurrency is multiple HTTP requests.
 - Detokenization decodes the full generated prefix each step. Stop-string filtering then decides how much of the new suffix is safe to emit.
 
-## CUDA plan
+## Phase 2 — CUDA forward path
 
-`flint-kernels` builds `kernels/rms_norm.cu` and `kernels/paged_attention.cu` when the `cuda` feature is on. `build.rs` is a no-op otherwise, which is why CI never passes `--all-features`.
+`--device cpu` stays the default and does not change the phase-1 math. `--device cuda` uploads the f32 weights once, keeps K and V in a device buffer with the same block layout as the host cache, and runs each scheduler step as one batched forward.
 
-The RMSNorm kernel is a real launch: one block per row, a warp-shuffle plus shared-memory reduction, then the scale. The paged-attention kernel is a correct slow baseline (one block per query head, scores in a local buffer capped at 4096 tokens) with the phase-2 shape written down next to it: online softmax, one warp per query head, a grid over heads and sequences, vectorized cache loads. Phase 2 replaces the CPU GEMM with cuBLAS (or a custom kernel for the shapes we actually hit), moves the paged cache to device memory, and calls these launches from `Model::forward` behind the same `LanguageModel` trait the HTTP engine already uses.
+```text
+tokens in the step are concatenated into one row batch
+for each layer:
+  RMSNorm, then cuBLAS GEMMs for Q, K, V
+  RoPE on Q and K, write K and V through the block tables
+  single-token rows: one paged-decode launch (one warp per query head)
+  multi-token rows: one causal prefill launch per sequence
+  output GEMM, residual add, RMSNorm, SwiGLU, down GEMM, residual add
+logits: final RMSNorm and the LM head, only for sequences that sample
+```
+
+cuBLAS runs in pedantic f32 (`CUBLAS_PEDANTIC_MATH`) so Ampere/Ada TF32 does not change the comparison against the CPU oracle. The kernels live in `kernels/ops.cu`. `build.rs` compiles them to PTX with `nvcc -ptx` when `--features cuda` is on, and `cudarc` loads that PTX with the driver API at runtime. Compiling the feature needs `nvcc`. Running it needs a GPU, `libcuda`, and `libcublas`. A machine without the toolkit never builds this path: the feature is off by default, and `build.rs` is a no-op then.
+
+Ignored tests compare the kernels and the full tiny-model logits to the CPU reference. They do not run in CI:
+
+```bash
+cargo test -p flint-kernels --features cuda -- --ignored
+cargo test -p flint-core --features cuda -- --ignored
+```
+
+On a fresh RunPod RTX 4090 (driver installed, repo checked out):
+
+```bash
+bash scripts/gpu_smoke.sh
+```
+
+The script installs build tools, Rust 1.100, and `nvcc` if they are missing, runs the ignored GPU tests, serves `Qwen/Qwen2.5-0.5B-Instruct` with `--device cuda`, and prints tok/s and TTFT at concurrency 1, 8, and 32. Point it at a local snapshot with `FLINT_MODEL_DIR`. Serve the same way by hand:
+
+```bash
+cargo build --release -p flint-server --features cuda
+./target/release/flint serve --device cuda --model-dir models/Qwen2.5-0.5B-Instruct \
+  --max-num-seqs 32 --num-blocks 512
+```
+
+What this chunk does not do: flash-attention tuning, quantization, speculative decoding, and scheduler prefix caching. The host `PagedKvCache` is still allocated beside the device cache; the GPU model does not read it. Prefill attention is a correct causal walk over the block table, not a fused flash kernel.
 
 ## Roadmap
 
-**Phase 2 — GPU execution.** Device KV cache in the same block layout, cuBLAS GEMM, fused RMSNorm, the flash-style paged-attention kernel, and a batched prefill that actually fuses across sequences. Turn the prefix-sharing API on in the scheduler. Keep the CPU path as the oracle.
+**Phase 2 — rest of GPU execution.** Flash-style attention for long prefills, scheduler prefix sharing on the device cache, and dropping the unused host KV allocation. The CPU path stays the oracle.
 
 **Phase 3 — the comparison that the project is for.** Speculative decoding with a small draft model, 8-bit and 4-bit weight quantization, and `flint-bench` against vLLM and llama.cpp server on RTX 4090, A100, and H100. Report tokens per second, time to first token, and cost per million tokens from the same JSON the harness already writes.
 
@@ -223,6 +257,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 ```
 
-GitHub Actions runs those three on push and pull request. The CUDA feature stays off. Model-download tests are `#[ignore]` and read `FLINT_MODEL_DIR`.
+GitHub Actions runs those three on push and pull request with the CUDA feature off. A second job installs `nvcc` and runs `cargo test` / `cargo clippy` for `--features cuda` without a GPU, so the ignored GPU tests are compiled and skipped. Model-download tests are `#[ignore]` and read `FLINT_MODEL_DIR`.
 
 License: MIT.
