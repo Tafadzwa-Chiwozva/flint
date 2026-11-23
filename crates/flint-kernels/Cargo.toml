@@ -5,16 +5,25 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "CPU math kernels and CUDA scaffolding for Flint"
+description = "CPU math kernels and the CUDA forward path for Flint"
 readme = "../../README.md"
 
 [features]
 default = []
-# Compiles the CUDA translation units with nvcc and links cudart.
-# The CPU forward pass does not call these kernels in phase 1.
-cuda = []
+# Compiles kernels/ops.cu to PTX and enables the driver/cuBLAS runtime.
+# The CPU forward pass does not call these kernels unless the server is
+# started with `--device cuda`.
+cuda = ["dep:cudarc"]
 
 [dependencies]
+cudarc = { version = "0.19.10", optional = true, default-features = false, features = [
+    "std",
+    "driver",
+    "cublas",
+    "nvrtc",
+    "fallback-dynamic-loading",
+    "cuda-12080",
+] }
 
 [dev-dependencies]
 rand = { workspace = true }
