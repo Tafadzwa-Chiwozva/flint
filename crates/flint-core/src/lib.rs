@@ -6,15 +6,16 @@
 //! Attention reads and writes a [`flint_kv::PagedKvCache`], which is the same
 //! cache the HTTP engine serves from.
 //!
-//! Phase 1 keeps this path on CPU and in f32. The `flint-kernels` crate holds
-//! the CUDA stubs that will replace [`flint_kernels::rms_norm`] and
-//! [`flint_kernels::paged_attention`] without changing this module's structure.
+//! The CPU path is f32 and is the oracle. With `--features cuda`, `GpuModel`
+//! uploads those same weights and runs the forward pass on device.
 
 #![deny(missing_docs)]
 
 mod config;
 mod error;
 mod gemm;
+#[cfg(feature = "cuda")]
+mod gpu;
 mod model;
 mod ops;
 mod sampling;
@@ -23,6 +24,8 @@ mod weights;
 
 pub use config::{EosTokenId, ModelConfig};
 pub use error::Error;
-pub use model::{ForwardOutput, Model};
+#[cfg(feature = "cuda")]
+pub use gpu::GpuModel;
+pub use model::{ForwardChunk, ForwardOutput, Model};
 pub use sampling::{sample, SamplingParams};
 pub use tokenizer::{apply_qwen_chat_template, ChatTurn, FlintTokenizer};

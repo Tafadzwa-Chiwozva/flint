@@ -19,6 +19,22 @@ use crate::gemm::linear;
 use crate::ops::{add_vec, apply_rope, inv_freq, rope_angles, swiglu};
 use crate::weights::TensorMap;
 
+/// One sequence inside a batched forward.
+///
+/// The CPU engine still runs these one at a time. The CUDA backend consumes a
+/// whole scheduler step as one slice of chunks.
+#[derive(Debug, Clone, Copy)]
+pub struct ForwardChunk<'a> {
+    /// Token ids for this chunk.
+    pub tokens: &'a [u32],
+    /// Absolute position of [`Self::tokens`]`[0]`.
+    pub position: usize,
+    /// Physical block ids covering the whole sequence, not just this chunk.
+    pub block_table: &'a [u32],
+    /// Return logits for the last token of the chunk.
+    pub want_logits: bool,
+}
+
 /// Last-token state from a forward chunk.
 #[derive(Debug, Clone)]
 pub struct ForwardOutput {
@@ -409,6 +425,56 @@ impl Model {
         resize(&mut self.scratch.cos, head);
         resize(&mut self.scratch.sin, head);
         resize(&mut self.scratch.rope_tmp, head);
+    }
+
+    /// Upload weights and allocate a device KV cache.
+    ///
+    /// The returned model owns the GPU buffers. Host weights are dropped.
+    /// `num_blocks` and `block_size` must match the scheduler that will drive it.
+    #[cfg(feature = "cuda")]
+    pub fn into_gpu(
+        self,
+        num_blocks: usize,
+        block_size: usize,
+    ) -> Result<crate::gpu::GpuModel, Error> {
+        let layers = self
+            .layers
+            .into_iter()
+            .map(|layer| crate::gpu::OwnedLayer {
+                input_norm: layer.input_norm,
+                post_norm: layer.post_norm,
+                q: own_linear(layer.q),
+                k: own_linear(layer.k),
+                v: own_linear(layer.v),
+                o: own_linear(layer.o),
+                gate: own_linear(layer.gate),
+                up: own_linear(layer.up),
+                down: own_linear(layer.down),
+            })
+            .collect();
+        crate::gpu::GpuModel::from_owned(
+            crate::gpu::OwnedWeights {
+                cfg: self.cfg,
+                embed: self.embed,
+                layers,
+                final_norm: self.final_norm,
+                lm_head: self.lm_head.map(own_linear),
+                inv_freq: self.inv_freq,
+                eos_ids: self.eos_ids,
+            },
+            num_blocks,
+            block_size,
+        )
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn own_linear(lin: Linear) -> crate::gpu::OwnedLinear {
+    crate::gpu::OwnedLinear {
+        weight: lin.weight,
+        bias: lin.bias,
+        out_features: lin.out_features,
+        in_features: lin.in_features,
     }
 }
 

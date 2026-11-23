@@ -8,6 +8,11 @@ rust-version.workspace = true
 description = "Qwen2/Llama forward pass, sampling, and weight loading for Flint"
 readme = "../../README.md"
 
+[features]
+default = []
+# Device weights, cuBLAS GEMMs, and the custom CUDA kernels.
+cuda = ["flint-kernels/cuda"]
+
 [dependencies]
 flint-kernels = { workspace = true }
 flint-kv = { workspace = true }
