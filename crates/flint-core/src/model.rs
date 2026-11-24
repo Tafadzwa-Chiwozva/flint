@@ -437,6 +437,17 @@ impl Model {
         num_blocks: usize,
         block_size: usize,
     ) -> Result<crate::gpu::GpuModel, Error> {
+        self.into_gpu_with(num_blocks, block_size, flint_kernels::cuda::GpuDType::F32)
+    }
+
+    /// Upload weights in `dtype`. [`Self::into_gpu`] is the f32 parity path.
+    #[cfg(feature = "cuda")]
+    pub fn into_gpu_with(
+        self,
+        num_blocks: usize,
+        block_size: usize,
+        dtype: flint_kernels::cuda::GpuDType,
+    ) -> Result<crate::gpu::GpuModel, Error> {
         let layers = self
             .layers
             .into_iter()
@@ -464,6 +475,7 @@ impl Model {
             },
             num_blocks,
             block_size,
+            dtype,
         )
     }
 }
