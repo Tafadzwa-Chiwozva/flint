@@ -9,7 +9,9 @@
 // each query walks its own key range. Prefill launches one warp per query
 // token; decode launches one warp per (sequence, query head).
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cstdint>
 
 namespace {
 
@@ -71,6 +73,156 @@ __device__ long long cache_index(
            static_cast<long long>(slot) * head_dim;
 }
 
+__device__ float load_float(float value) { return value; }
+
+__device__ float load_float(__nv_bfloat16 value) { return __bfloat162float(value); }
+
+__device__ void store_one(float* dst, float value) { *dst = value; }
+
+__device__ void store_one(__nv_bfloat16* dst, float value) { *dst = __float2bfloat16(value); }
+
+__device__ void load_contig(const float* ptr, int n, float* dst) {
+    int i = 0;
+    auto addr = reinterpret_cast<uintptr_t>(ptr);
+    if (n >= 4 && (addr & 0xF) == 0) {
+        for (; i + 4 <= n; i += 4) {
+            float4 v = *reinterpret_cast<const float4*>(ptr + i);
+            dst[i] = v.x;
+            dst[i + 1] = v.y;
+            dst[i + 2] = v.z;
+            dst[i + 3] = v.w;
+        }
+    } else if (n >= 2 && (addr & 0x7) == 0) {
+        for (; i + 2 <= n; i += 2) {
+            float2 v = *reinterpret_cast<const float2*>(ptr + i);
+            dst[i] = v.x;
+            dst[i + 1] = v.y;
+        }
+    }
+    for (; i < n; ++i) {
+        dst[i] = ptr[i];
+    }
+}
+
+__device__ void load_contig(const __nv_bfloat16* ptr, int n, float* dst) {
+    int i = 0;
+    auto addr = reinterpret_cast<uintptr_t>(ptr);
+    if (n >= 8 && (addr & 0xF) == 0) {
+        const uint4 v = *reinterpret_cast<const uint4*>(ptr);
+        const unsigned packed[4] = {v.x, v.y, v.z, v.w};
+        for (int p = 0; p < 4; ++p) {
+            __nv_bfloat162 pair = *reinterpret_cast<const __nv_bfloat162*>(&packed[p]);
+            dst[p * 2] = __low2float(pair);
+            dst[p * 2 + 1] = __high2float(pair);
+        }
+        i = 8;
+    } else if (n >= 2 && (addr & 0x3) == 0) {
+        for (; i + 2 <= n; i += 2) {
+            __nv_bfloat162 pair = *reinterpret_cast<const __nv_bfloat162*>(ptr + i);
+            dst[i] = __low2float(pair);
+            dst[i + 1] = __high2float(pair);
+        }
+    }
+    for (; i < n; ++i) {
+        dst[i] = __bfloat162float(ptr[i]);
+    }
+}
+
+// Aligned head: lane `lane` owns `head_dim/32` contiguous channels and vector-loads
+// them. Token range is [t0, t1). When `partial_max` is null the result is stored
+// to `out_head`; otherwise the f32 partial (max, sum, acc) is written for split-K.
+template <typename T>
+__device__ void attend_aligned(
+    T* __restrict__ out_head,
+    float* __restrict__ partial_acc,
+    float* __restrict__ partial_max,
+    float* __restrict__ partial_sum,
+    const T* __restrict__ query_head,
+    const T* __restrict__ key_cache,
+    const T* __restrict__ value_cache,
+    const int* __restrict__ table,
+    int t0,
+    int t1,
+    int kv_h,
+    int layer,
+    int head_dim,
+    int block_size,
+    int num_layers,
+    int num_kv_heads,
+    float scale,
+    int lane) {
+    int n = head_dim >> 5;
+    float qreg[8];
+    float acc[8];
+    const T* qptr = query_head + lane * n;
+    load_contig(qptr, n, qreg);
+    for (int i = 0; i < n; ++i) {
+        acc[i] = 0.f;
+    }
+    if (t1 <= t0) {
+        if (partial_max != nullptr && lane == 0) {
+            *partial_max = -1e30f;
+            *partial_sum = 0.f;
+        }
+        if (partial_acc != nullptr) {
+            for (int i = 0; i < n; ++i) {
+                partial_acc[lane * n + i] = 0.f;
+            }
+        } else if (out_head != nullptr) {
+            for (int i = 0; i < n; ++i) {
+                store_one(&out_head[lane * n + i], 0.f);
+            }
+        }
+        return;
+    }
+
+    int seen = 0;
+    float max_score = 0.f;
+    float sum = 0.f;
+    for (int t = t0; t < t1; ++t) {
+        int block = table[t / block_size];
+        int slot = t % block_size;
+        const T* key = key_cache + cache_index(
+                                       block, layer, kv_h, slot, block_size, num_layers,
+                                       num_kv_heads, head_dim);
+        const T* value = value_cache + cache_index(
+                                           block, layer, kv_h, slot, block_size, num_layers,
+                                           num_kv_heads, head_dim);
+        float kreg[8];
+        float vreg[8];
+        load_contig(key + lane * n, n, kreg);
+        float partial = 0.f;
+        for (int i = 0; i < n; ++i) {
+            partial += qreg[i] * kreg[i];
+        }
+        float score = warp_sum(partial) * scale;
+        float next_max = seen ? fmaxf(max_score, score) : score;
+        float alpha = seen ? expf(max_score - next_max) : 0.f;
+        float prob = expf(score - next_max);
+        sum = sum * alpha + prob;
+        max_score = next_max;
+        seen = 1;
+        load_contig(value + lane * n, n, vreg);
+        for (int i = 0; i < n; ++i) {
+            acc[i] = acc[i] * alpha + prob * vreg[i];
+        }
+    }
+    if (partial_max != nullptr) {
+        if (lane == 0) {
+            *partial_max = max_score;
+            *partial_sum = sum;
+        }
+        for (int i = 0; i < n; ++i) {
+            partial_acc[lane * n + i] = acc[i];
+        }
+        return;
+    }
+    float inv = sum == 0.f ? 0.f : 1.f / sum;
+    for (int i = 0; i < n; ++i) {
+        store_one(&out_head[lane * n + i], acc[i] * inv);
+    }
+}
+
 // One query head. `lane` is threadIdx.x in a 32-thread block. `table` points
 // at this sequence's block table.
 __device__ void attend_one(
@@ -113,6 +265,16 @@ __device__ void attend_one(
     int start = 0;
     if (sliding_window >= 0 && sliding_window < seq_len) {
         start = seq_len - sliding_window;
+    }
+
+    // Head dims that divide the warp use contiguous vector loads (float4 /
+    // bfloat162). head_dim 4, used by the kernel unit tests, stays on the
+    // scalar path below so the reduction order does not change.
+    if ((head_dim & 31) == 0) {
+        attend_aligned<float>(
+            out_head, nullptr, nullptr, nullptr, query_head, key_cache, value_cache, table, start,
+            seq_len, kv_h, layer, head_dim, block_size, num_layers, num_kv_heads, scale, lane);
+        return;
     }
 
     // `seen` starts false so the first score sets the running max. expf (not
@@ -418,3 +580,5 @@ extern "C" __global__ void flint_paged_prefill(
         sliding_window,
         threadIdx.x);
 }
+
+#include "bf16_ext.cu"

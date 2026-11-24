@@ -6,14 +6,19 @@
 //! TF32 does not change the result). Nothing here runs unless a caller
 //! constructs a [`Device`], which needs a live NVIDIA driver.
 
-use std::ffi::c_int;
+use std::ffi::{c_int, c_void};
 use std::sync::Arc;
 
-use cudarc::cublas::sys::{cublasMath_t, cublasOperation_t, cublasSetMathMode, cublasStatus_t};
+use cudarc::cublas::sys::{
+    cublasComputeType_t, cublasGemmAlgo_t, cublasMath_t, cublasOperation_t, cublasSetMathMode,
+    cublasStatus_t, cudaDataType_t,
+};
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+use cudarc::driver::sys::CUgraphInstantiate_flags;
+use cudarc::driver::CudaGraph;
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut,
-    LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr,
+    DevicePtrMut, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
 
@@ -63,6 +68,12 @@ pub struct F32Buf {
     cap: usize,
 }
 
+/// Device buffer of bf16, stored as 16-bit words. Kernels interpret the bits.
+pub struct Bf16Buf {
+    data: Option<CudaSlice<u16>>,
+    cap: usize,
+}
+
 /// Device buffer of `i32` (token ids, positions, block tables).
 pub struct I32Buf {
     data: Option<CudaSlice<i32>>,
@@ -107,7 +118,51 @@ impl F32Buf {
     }
 }
 
+impl Bf16Buf {
+    /// Empty allocation. Grown by [`Device::ensure_bf16`].
+    #[must_use]
+    pub fn empty() -> Self {
+        Self { data: None, cap: 0 }
+    }
+
+    fn view(&self, n: usize) -> Result<CudaView<'_, u16>, CudaError> {
+        let data = self
+            .data
+            .as_ref()
+            .ok_or_else(|| CudaError::new(format!("empty bf16 buffer, need {n} elements")))?;
+        if n > self.cap {
+            return Err(CudaError::new(format!(
+                "bf16 buffer cap {} is shorter than {n}",
+                self.cap
+            )));
+        }
+        data.try_slice(0..n)
+            .ok_or_else(|| CudaError::new(format!("bf16 slice 0..{n} rejected")))
+    }
+
+    fn view_mut(&mut self, n: usize) -> Result<CudaViewMut<'_, u16>, CudaError> {
+        let cap = self.cap;
+        let data = self
+            .data
+            .as_mut()
+            .ok_or_else(|| CudaError::new(format!("empty bf16 buffer, need {n} elements")))?;
+        if n > cap {
+            return Err(CudaError::new(format!(
+                "bf16 buffer cap {cap} is shorter than {n}"
+            )));
+        }
+        data.try_slice_mut(0..n)
+            .ok_or_else(|| CudaError::new(format!("bf16 slice 0..{n} rejected")))
+    }
+}
+
 impl I32Buf {
+    /// Empty allocation. [`Device::fill_i32`] grows it on first use.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self { data: None, cap: 0 }
+    }
+
     fn view(&self, n: usize) -> Result<CudaView<'_, i32>, CudaError> {
         let data = self
             .data
@@ -120,6 +175,21 @@ impl I32Buf {
             )));
         }
         data.try_slice(0..n)
+            .ok_or_else(|| CudaError::new(format!("i32 slice 0..{n} rejected")))
+    }
+
+    fn view_mut(&mut self, n: usize) -> Result<CudaViewMut<'_, i32>, CudaError> {
+        let cap = self.cap;
+        let data = self
+            .data
+            .as_mut()
+            .ok_or_else(|| CudaError::new(format!("empty i32 buffer, need {n} elements")))?;
+        if n > cap {
+            return Err(CudaError::new(format!(
+                "i32 buffer cap {cap} is shorter than {n}"
+            )));
+        }
+        data.try_slice_mut(0..n)
             .ok_or_else(|| CudaError::new(format!("i32 slice 0..{n} rejected")))
     }
 }
@@ -159,6 +229,41 @@ pub struct Device {
     write_kv: CudaFunction,
     paged_decode: CudaFunction,
     paged_prefill: CudaFunction,
+    residual_rms_f32: CudaFunction,
+    add_rms_f32: CudaFunction,
+    rms_bf16: CudaFunction,
+    rope_bf16: CudaFunction,
+    swiglu_bf16: CudaFunction,
+    add_bf16: CudaFunction,
+    bias_bf16: CudaFunction,
+    embed_bf16: CudaFunction,
+    gather_bf16: CudaFunction,
+    write_kv_bf16: CudaFunction,
+    residual_rms_bf16: CudaFunction,
+    add_rms_bf16: CudaFunction,
+    cast_to_bf16: CudaFunction,
+    paged_decode_bf16: CudaFunction,
+    decode_combine_bf16: CudaFunction,
+    paged_prefill_bf16: CudaFunction,
+}
+
+/// A captured decode step. Replayed with [`Device::launch_graph`].
+///
+/// The engine thread owns the model, so the graph is sent once and then
+/// launched from that thread only.
+pub struct CapturedGraph {
+    inner: CudaGraph,
+}
+
+unsafe impl Send for CapturedGraph {}
+
+/// Storage format for GPU weights and activations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuDType {
+    /// Full f32, pedantic cuBLAS. This is the parity path.
+    F32,
+    /// bf16 storage with f32 accumulation and tensor cores.
+    Bf16,
 }
 
 impl Device {
@@ -192,7 +297,35 @@ impl Device {
             write_kv: function(&module, "flint_write_kv")?,
             paged_decode: function(&module, "flint_paged_decode")?,
             paged_prefill: function(&module, "flint_paged_prefill")?,
+            residual_rms_f32: function(&module, "flint_residual_rms_f32")?,
+            add_rms_f32: function(&module, "flint_add_rms_f32")?,
+            rms_bf16: function(&module, "flint_rms_norm_bf16")?,
+            rope_bf16: function(&module, "flint_rope_bf16")?,
+            swiglu_bf16: function(&module, "flint_swiglu_bf16")?,
+            add_bf16: function(&module, "flint_add_bf16")?,
+            bias_bf16: function(&module, "flint_bias_bf16")?,
+            embed_bf16: function(&module, "flint_embed_bf16")?,
+            gather_bf16: function(&module, "flint_gather_rows_bf16")?,
+            write_kv_bf16: function(&module, "flint_write_kv_bf16")?,
+            residual_rms_bf16: function(&module, "flint_residual_rms_bf16")?,
+            add_rms_bf16: function(&module, "flint_add_rms_bf16")?,
+            cast_to_bf16: function(&module, "flint_f32_to_bf16")?,
+            paged_decode_bf16: function(&module, "flint_paged_decode_bf16")?,
+            decode_combine_bf16: function(&module, "flint_decode_combine_bf16")?,
+            paged_prefill_bf16: function(&module, "flint_paged_prefill_bf16")?,
         })
+    }
+
+    /// Tensor-core math for the bf16 path. f32 parity stays on pedantic SGEMM.
+    pub fn use_tensor_cores(&self) -> Result<(), CudaError> {
+        let status =
+            unsafe { cublasSetMathMode(*self.blas.handle(), cublasMath_t::CUBLAS_TENSOR_OP_MATH) };
+        if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(CudaError::new(format!(
+                "cublasSetMathMode(TENSOR_OP) returned {status:?}"
+            )));
+        }
+        Ok(())
     }
 
     /// Allocate `n` zeroed floats. `n == 0` yields an empty buffer.
@@ -252,6 +385,17 @@ impl Device {
 
     /// `dst[0..n] = src[0..n]`.
     pub fn copy_f32(&self, src: &F32Buf, dst: &mut F32Buf, n: usize) -> Result<(), CudaError> {
+        if n == 0 {
+            return Ok(());
+        }
+        let from = src.view(n)?;
+        let mut to = dst.view_mut(n)?;
+        self.stream.memcpy_dtod(&from, &mut to)?;
+        Ok(())
+    }
+
+    /// Copy `n` bf16 values.
+    pub fn copy_bf16(&self, src: &Bf16Buf, dst: &mut Bf16Buf, n: usize) -> Result<(), CudaError> {
         if n == 0 {
             return Ok(());
         }
@@ -716,6 +860,838 @@ impl Device {
     }
 }
 
+impl Device {
+    /// Copy `data` into `buf`, allocating only when the buffer is too small.
+    /// The bool is true when the device address changed.
+    pub fn fill_i32(&self, buf: &mut I32Buf, data: &[i32]) -> Result<bool, CudaError> {
+        if data.is_empty() {
+            return Ok(false);
+        }
+        if buf.data.is_none() || buf.cap < data.len() {
+            *buf = self.upload_i32(data)?;
+            return Ok(true);
+        }
+        let mut view = buf.view_mut(data.len())?;
+        self.stream.memcpy_htod(data, &mut view)?;
+        Ok(false)
+    }
+
+    /// Allocate `n` zeroed bf16 values.
+    pub fn alloc_bf16(&self, n: usize) -> Result<Bf16Buf, CudaError> {
+        if n == 0 {
+            return Ok(Bf16Buf::empty());
+        }
+        let data = self.stream.alloc_zeros::<u16>(n)?;
+        Ok(Bf16Buf {
+            data: Some(data),
+            cap: n,
+        })
+    }
+
+    /// Grow `buf` so it can hold `n` bf16 values. Existing contents are dropped.
+    pub fn ensure_bf16(&self, buf: &mut Bf16Buf, n: usize) -> Result<(), CudaError> {
+        if buf.cap >= n && (n == 0 || buf.data.is_some()) {
+            return Ok(());
+        }
+        *buf = self.alloc_bf16(n)?;
+        Ok(())
+    }
+
+    /// Upload f32 host weights and store them as bf16.
+    pub fn upload_bf16_from_f32(&self, data: &[f32]) -> Result<Bf16Buf, CudaError> {
+        if data.is_empty() {
+            return Ok(Bf16Buf::empty());
+        }
+        let src = self.upload_f32(data)?;
+        let mut dst = self.alloc_bf16(data.len())?;
+        self.cast_f32_to_bf16(&src, &mut dst, data.len())?;
+        Ok(dst)
+    }
+
+    fn cast_f32_to_bf16(&self, src: &F32Buf, dst: &mut Bf16Buf, n: usize) -> Result<(), CudaError> {
+        let n_i = as_i32(n, "cast n")?;
+        let mut dst_v = dst.view_mut(n)?;
+        let src_v = src.view(n)?;
+        let cfg = linear_cfg(n)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.cast_to_bf16)
+                .arg(&mut dst_v)
+                .arg(&src_v)
+                .arg(&n_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Copy `x` into `residual` and write RMSNorm(`x`) into `out`. One launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_residual_rms_f32(
+        &self,
+        residual: &mut F32Buf,
+        out: &mut F32Buf,
+        x: &F32Buf,
+        weight: &F32Buf,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> Result<(), CudaError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let rows_i = as_i32(rows, "residual rows")?;
+        let cols_i = as_i32(cols, "residual cols")?;
+        let mut residual_v = residual.view_mut(rows * cols)?;
+        let mut out_v = out.view_mut(rows * cols)?;
+        let x_v = x.view(rows * cols)?;
+        let w_v = weight.view(cols)?;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_rms_f32)
+                .arg(&mut residual_v)
+                .arg(&mut out_v)
+                .arg(&x_v)
+                .arg(&w_v)
+                .arg(&rows_i)
+                .arg(&cols_i)
+                .arg(&eps)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// bf16 copy plus RMSNorm. The sum of squares is accumulated in f32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_residual_rms_bf16(
+        &self,
+        residual: &mut Bf16Buf,
+        out: &mut Bf16Buf,
+        x: &Bf16Buf,
+        weight: &Bf16Buf,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> Result<(), CudaError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let rows_i = as_i32(rows, "residual rows")?;
+        let cols_i = as_i32(cols, "residual cols")?;
+        let mut residual_v = residual.view_mut(rows * cols)?;
+        let mut out_v = out.view_mut(rows * cols)?;
+        let x_v = x.view(rows * cols)?;
+        let w_v = weight.view(cols)?;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_rms_bf16)
+                .arg(&mut residual_v)
+                .arg(&mut out_v)
+                .arg(&x_v)
+                .arg(&w_v)
+                .arg(&rows_i)
+                .arg(&cols_i)
+                .arg(&eps)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// `sum = a + b`, then RMSNorm(`sum`) into `normed`. One launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_add_rms_f32(
+        &self,
+        sum: &mut F32Buf,
+        normed: &mut F32Buf,
+        a: &F32Buf,
+        b: &F32Buf,
+        weight: &F32Buf,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> Result<(), CudaError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let rows_i = as_i32(rows, "add-rms rows")?;
+        let cols_i = as_i32(cols, "add-rms cols")?;
+        let mut sum_v = sum.view_mut(rows * cols)?;
+        let mut normed_v = normed.view_mut(rows * cols)?;
+        let a_v = a.view(rows * cols)?;
+        let b_v = b.view(rows * cols)?;
+        let w_v = weight.view(cols)?;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.add_rms_f32)
+                .arg(&mut sum_v)
+                .arg(&mut normed_v)
+                .arg(&a_v)
+                .arg(&b_v)
+                .arg(&w_v)
+                .arg(&rows_i)
+                .arg(&cols_i)
+                .arg(&eps)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// bf16 residual add plus RMSNorm. Accumulation is f32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_add_rms_bf16(
+        &self,
+        sum: &mut Bf16Buf,
+        normed: &mut Bf16Buf,
+        a: &Bf16Buf,
+        b: &Bf16Buf,
+        weight: &Bf16Buf,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> Result<(), CudaError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let rows_i = as_i32(rows, "add-rms rows")?;
+        let cols_i = as_i32(cols, "add-rms cols")?;
+        let mut sum_v = sum.view_mut(rows * cols)?;
+        let mut normed_v = normed.view_mut(rows * cols)?;
+        let a_v = a.view(rows * cols)?;
+        let b_v = b.view(rows * cols)?;
+        let w_v = weight.view(cols)?;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.add_rms_bf16)
+                .arg(&mut sum_v)
+                .arg(&mut normed_v)
+                .arg(&a_v)
+                .arg(&b_v)
+                .arg(&w_v)
+                .arg(&rows_i)
+                .arg(&cols_i)
+                .arg(&eps)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// `Y = X @ W.T` with bf16 inputs, f32 accumulation, and a bf16 result.
+    pub fn gemm_bf16(
+        &self,
+        x: &Bf16Buf,
+        w: &Bf16Buf,
+        y: &mut Bf16Buf,
+        rows: usize,
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 || out_features == 0 {
+            return Ok(());
+        }
+        let x_v = x.view(rows * in_features)?;
+        let w_v = w.view(out_features * in_features)?;
+        let mut y_v = y.view_mut(rows * out_features)?;
+        let (w_ptr, w_sync) = w_v.device_ptr(&self.stream);
+        let (x_ptr, x_sync) = x_v.device_ptr(&self.stream);
+        let (y_ptr, y_sync) = y_v.device_ptr_mut(&self.stream);
+        self.gemm_ex_raw(
+            w_ptr,
+            x_ptr,
+            y_ptr,
+            rows,
+            out_features,
+            in_features,
+            cudaDataType_t::CUDA_R_16BF,
+        )?;
+        drop((w_sync, x_sync, y_sync));
+        Ok(())
+    }
+
+    /// Same product as [`Self::gemm_bf16`], writing an f32 matrix (the logits).
+    pub fn gemm_bf16_f32(
+        &self,
+        x: &Bf16Buf,
+        w: &Bf16Buf,
+        y: &mut F32Buf,
+        rows: usize,
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 || out_features == 0 {
+            return Ok(());
+        }
+        let x_v = x.view(rows * in_features)?;
+        let w_v = w.view(out_features * in_features)?;
+        let mut y_v = y.view_mut(rows * out_features)?;
+        let (w_ptr, w_sync) = w_v.device_ptr(&self.stream);
+        let (x_ptr, x_sync) = x_v.device_ptr(&self.stream);
+        let (y_ptr, y_sync) = y_v.device_ptr_mut(&self.stream);
+        self.gemm_ex_raw(
+            w_ptr,
+            x_ptr,
+            y_ptr,
+            rows,
+            out_features,
+            in_features,
+            cudaDataType_t::CUDA_R_32F,
+        )?;
+        drop((w_sync, x_sync, y_sync));
+        Ok(())
+    }
+
+    /// RMSNorm over bf16 rows. The sum of squares is f32.
+    pub fn rms_norm_bf16(
+        &self,
+        out: &mut Bf16Buf,
+        x: &Bf16Buf,
+        weight: &Bf16Buf,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> Result<(), CudaError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let rows_i = as_i32(rows, "rms rows")?;
+        let cols_i = as_i32(cols, "rms cols")?;
+        let mut out_v = out.view_mut(rows * cols)?;
+        let x_v = x.view(rows * cols)?;
+        let w_v = weight.view(cols)?;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.rms_bf16)
+                .arg(&mut out_v)
+                .arg(&x_v)
+                .arg(&w_v)
+                .arg(&rows_i)
+                .arg(&cols_i)
+                .arg(&eps)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// In-place rotate-half RoPE on bf16. `inv_freq` stays f32.
+    pub fn rope_bf16(
+        &self,
+        x: &mut Bf16Buf,
+        positions: &I32Buf,
+        inv_freq: &F32Buf,
+        rows: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let total = rows * n_heads;
+        let rows_i = as_i32(rows, "rope rows")?;
+        let heads_i = as_i32(n_heads, "rope heads")?;
+        let dim_i = as_i32(head_dim, "rope head_dim")?;
+        let mut x_v = x.view_mut(rows * n_heads * head_dim)?;
+        let pos_v = positions.view(rows)?;
+        let freq_v = inv_freq.view(head_dim / 2)?;
+        let cfg = LaunchConfig {
+            grid_dim: (total as u32, 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.rope_bf16)
+                .arg(&mut x_v)
+                .arg(&pos_v)
+                .arg(&freq_v)
+                .arg(&rows_i)
+                .arg(&heads_i)
+                .arg(&dim_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// In-place SwiGLU over `n` bf16 elements.
+    pub fn swiglu_bf16(&self, gate: &mut Bf16Buf, up: &Bf16Buf, n: usize) -> Result<(), CudaError> {
+        if n == 0 {
+            return Ok(());
+        }
+        let n_i = as_i32(n, "swiglu n")?;
+        let mut gate_v = gate.view_mut(n)?;
+        let up_v = up.view(n)?;
+        let cfg = linear_cfg(n)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.swiglu_bf16)
+                .arg(&mut gate_v)
+                .arg(&up_v)
+                .arg(&n_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// `dst[i] = a[i] + b[i]` for `n` bf16 elements. `dst` may alias `a`.
+    pub fn add_bf16(
+        &self,
+        dst: &mut Bf16Buf,
+        a: &Bf16Buf,
+        b: &Bf16Buf,
+        n: usize,
+    ) -> Result<(), CudaError> {
+        if n == 0 {
+            return Ok(());
+        }
+        let n_i = as_i32(n, "add n")?;
+        let mut dst_v = dst.view_mut(n)?;
+        let a_v = a.view(n)?;
+        let b_v = b.view(n)?;
+        let cfg = linear_cfg(n)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.add_bf16)
+                .arg(&mut dst_v)
+                .arg(&a_v)
+                .arg(&b_v)
+                .arg(&n_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Add a bf16 bias of length `cols` to every row.
+    pub fn bias_bf16(
+        &self,
+        y: &mut Bf16Buf,
+        bias: &Bf16Buf,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let rows_i = as_i32(rows, "bias rows")?;
+        let cols_i = as_i32(cols, "bias cols")?;
+        let mut y_v = y.view_mut(rows * cols)?;
+        let b_v = bias.view(cols)?;
+        let cfg = linear_cfg(rows * cols)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.bias_bf16)
+                .arg(&mut y_v)
+                .arg(&b_v)
+                .arg(&rows_i)
+                .arg(&cols_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Gather bf16 embedding rows.
+    pub fn embed_bf16(
+        &self,
+        out: &mut Bf16Buf,
+        table: &Bf16Buf,
+        tokens: &I32Buf,
+        rows: usize,
+        hidden: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let rows_i = as_i32(rows, "embed rows")?;
+        let hidden_i = as_i32(hidden, "embed hidden")?;
+        let table_n = table.cap;
+        let mut out_v = out.view_mut(rows * hidden)?;
+        let table_v = table.view(table_n)?;
+        let tok_v = tokens.view(rows)?;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.embed_bf16)
+                .arg(&mut out_v)
+                .arg(&table_v)
+                .arg(&tok_v)
+                .arg(&rows_i)
+                .arg(&hidden_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// `dst[i] = src[rows[i]]` for `n` bf16 rows of `cols`.
+    pub fn gather_rows_bf16(
+        &self,
+        dst: &mut Bf16Buf,
+        src: &Bf16Buf,
+        rows: &I32Buf,
+        n: usize,
+        cols: usize,
+    ) -> Result<(), CudaError> {
+        if n == 0 {
+            return Ok(());
+        }
+        let n_i = as_i32(n, "gather n")?;
+        let cols_i = as_i32(cols, "gather cols")?;
+        let src_n = src.cap;
+        let mut dst_v = dst.view_mut(n * cols)?;
+        let src_v = src.view(src_n)?;
+        let rows_v = rows.view(n)?;
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.gather_bf16)
+                .arg(&mut dst_v)
+                .arg(&src_v)
+                .arg(&rows_v)
+                .arg(&n_i)
+                .arg(&cols_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_ex_raw(
+        &self,
+        w_ptr: cudarc::driver::sys::CUdeviceptr,
+        x_ptr: cudarc::driver::sys::CUdeviceptr,
+        y_ptr: cudarc::driver::sys::CUdeviceptr,
+        rows: usize,
+        out_features: usize,
+        in_features: usize,
+        c_type: cudaDataType_t,
+    ) -> Result<(), CudaError> {
+        let m = as_i32(out_features, "gemm n")?;
+        let n = as_i32(rows, "gemm m")?;
+        let k = as_i32(in_features, "gemm k")?;
+        let alpha = 1.0_f32;
+        let beta = 0.0_f32;
+        unsafe {
+            cudarc::cublas::result::gemm_ex(
+                *self.blas.handle(),
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                m,
+                n,
+                k,
+                (&alpha) as *const f32 as *const c_void,
+                w_ptr as *const c_void,
+                cudaDataType_t::CUDA_R_16BF,
+                k,
+                x_ptr as *const c_void,
+                cudaDataType_t::CUDA_R_16BF,
+                k,
+                (&beta) as *const f32 as *const c_void,
+                y_ptr as *mut c_void,
+                c_type,
+                m,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Write each row of bf16 `k` and `v` into the paged cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_kv_bf16(
+        &self,
+        key_cache: &mut Bf16Buf,
+        value_cache: &mut Bf16Buf,
+        k: &Bf16Buf,
+        v: &Bf16Buf,
+        positions: &I32Buf,
+        table_offsets: &I32Buf,
+        block_tables: &I32Buf,
+        rows: usize,
+        layer: i32,
+        n_kv: usize,
+        head_dim: usize,
+        block_size: usize,
+        num_layers: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let total = rows * n_kv;
+        let rows_i = as_i32(rows, "write_kv rows")?;
+        let n_kv_i = as_i32(n_kv, "write_kv heads")?;
+        let dim_i = as_i32(head_dim, "write_kv head_dim")?;
+        let block_i = as_i32(block_size, "write_kv block_size")?;
+        let layers_i = as_i32(num_layers, "write_kv layers")?;
+        let key_n = key_cache.cap;
+        let val_n = value_cache.cap;
+        let table_n = block_tables.cap;
+        let mut key_v = key_cache.view_mut(key_n)?;
+        let mut val_v = value_cache.view_mut(val_n)?;
+        let k_v = k.view(rows * n_kv * head_dim)?;
+        let v_v = v.view(rows * n_kv * head_dim)?;
+        let pos_v = positions.view(rows)?;
+        let off_v = table_offsets.view(rows)?;
+        let table_v = block_tables.view(table_n)?;
+        let cfg = LaunchConfig {
+            grid_dim: (total as u32, 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.write_kv_bf16)
+                .arg(&mut key_v)
+                .arg(&mut val_v)
+                .arg(&k_v)
+                .arg(&v_v)
+                .arg(&pos_v)
+                .arg(&off_v)
+                .arg(&table_v)
+                .arg(&rows_i)
+                .arg(&layer)
+                .arg(&n_kv_i)
+                .arg(&dim_i)
+                .arg(&block_i)
+                .arg(&layers_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Batched bf16 decode attention. `splits > 1` writes f32 partials that
+    /// [`Self::decode_combine_bf16`] merges. `splits == 1` writes `out` directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paged_decode_bf16(
+        &self,
+        out: &mut Bf16Buf,
+        partial_acc: &mut F32Buf,
+        partial_max: &mut F32Buf,
+        partial_sum: &mut F32Buf,
+        query: &Bf16Buf,
+        key_cache: &Bf16Buf,
+        value_cache: &Bf16Buf,
+        block_tables: &I32Buf,
+        table_offsets: &I32Buf,
+        seq_lens: &I32Buf,
+        row_index: &I32Buf,
+        batch: usize,
+        splits: i32,
+        shape: AttnShape,
+    ) -> Result<(), CudaError> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let batch_i = as_i32(batch, "decode batch")?;
+        let out_n = out.cap;
+        let key_n = key_cache.cap;
+        let val_n = value_cache.cap;
+        let table_n = block_tables.cap;
+        let q_n = query.cap;
+        let mut out_v = out.view_mut(out_n)?;
+        let mut acc_v = partial_acc.view_mut(partial_acc.cap.max(1))?;
+        let mut max_v = partial_max.view_mut(partial_max.cap.max(1))?;
+        let mut sum_v = partial_sum.view_mut(partial_sum.cap.max(1))?;
+        let q_v = query.view(q_n)?;
+        let k_v = key_cache.view(key_n)?;
+        let v_v = value_cache.view(val_n)?;
+        let tables = block_tables.view(table_n)?;
+        let offs = table_offsets.view(batch)?;
+        let lens = seq_lens.view(batch)?;
+        let rows = row_index.view(batch)?;
+        let grid = shape.num_qo_heads as usize * batch * splits.max(1) as usize;
+        let cfg = LaunchConfig {
+            grid_dim: (grid as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.paged_decode_bf16)
+                .arg(&mut out_v)
+                .arg(&mut acc_v)
+                .arg(&mut max_v)
+                .arg(&mut sum_v)
+                .arg(&q_v)
+                .arg(&k_v)
+                .arg(&v_v)
+                .arg(&tables)
+                .arg(&offs)
+                .arg(&lens)
+                .arg(&rows)
+                .arg(&batch_i)
+                .arg(&splits)
+                .arg(&shape.layer)
+                .arg(&shape.num_qo_heads)
+                .arg(&shape.num_kv_heads)
+                .arg(&shape.head_dim)
+                .arg(&shape.block_size)
+                .arg(&shape.num_layers)
+                .arg(&shape.scale)
+                .arg(&shape.sliding_window)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Merge split-K bf16 decode partials into `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_combine_bf16(
+        &self,
+        out: &mut Bf16Buf,
+        partial_acc: &F32Buf,
+        partial_max: &F32Buf,
+        partial_sum: &F32Buf,
+        row_index: &I32Buf,
+        batch: usize,
+        splits: i32,
+        num_qo_heads: i32,
+        head_dim: i32,
+    ) -> Result<(), CudaError> {
+        if batch == 0 || splits <= 1 {
+            return Ok(());
+        }
+        let batch_i = as_i32(batch, "combine batch")?;
+        let out_n = out.cap;
+        let mut out_v = out.view_mut(out_n)?;
+        let acc_v = partial_acc.view(partial_acc.cap)?;
+        let max_v = partial_max.view(partial_max.cap)?;
+        let sum_v = partial_sum.view(partial_sum.cap)?;
+        let rows = row_index.view(batch)?;
+        let grid = num_qo_heads as usize * batch;
+        let cfg = LaunchConfig {
+            grid_dim: (grid as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.decode_combine_bf16)
+                .arg(&mut out_v)
+                .arg(&acc_v)
+                .arg(&max_v)
+                .arg(&sum_v)
+                .arg(&rows)
+                .arg(&batch_i)
+                .arg(&splits)
+                .arg(&num_qo_heads)
+                .arg(&head_dim)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// One query token of a bf16 prefill chunk. Same layout as the f32 kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paged_prefill_bf16(
+        &self,
+        out: &mut Bf16Buf,
+        query: &Bf16Buf,
+        key_cache: &Bf16Buf,
+        value_cache: &Bf16Buf,
+        block_tables: &I32Buf,
+        table_offset: i32,
+        row0: i32,
+        chunk: i32,
+        position: i32,
+        shape: AttnShape,
+    ) -> Result<(), CudaError> {
+        if chunk <= 0 {
+            return Ok(());
+        }
+        let out_n = out.cap;
+        let key_n = key_cache.cap;
+        let val_n = value_cache.cap;
+        let table_n = block_tables.cap;
+        let q_n = query.cap;
+        let mut out_v = out.view_mut(out_n)?;
+        let q_v = query.view(q_n)?;
+        let k_v = key_cache.view(key_n)?;
+        let v_v = value_cache.view(val_n)?;
+        let tables = block_tables.view(table_n)?;
+        let total = shape.num_qo_heads as usize * chunk as usize;
+        let cfg = LaunchConfig {
+            grid_dim: (total as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.paged_prefill_bf16)
+                .arg(&mut out_v)
+                .arg(&q_v)
+                .arg(&k_v)
+                .arg(&v_v)
+                .arg(&tables)
+                .arg(&table_offset)
+                .arg(&row0)
+                .arg(&chunk)
+                .arg(&position)
+                .arg(&shape.layer)
+                .arg(&shape.num_qo_heads)
+                .arg(&shape.num_kv_heads)
+                .arg(&shape.head_dim)
+                .arg(&shape.block_size)
+                .arg(&shape.num_layers)
+                .arg(&shape.scale)
+                .arg(&shape.sliding_window)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Record launches until [`Self::end_capture`]. The recorded work does not run.
+    pub fn begin_capture(&self) -> Result<(), CudaError> {
+        self.stream.begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+        )?;
+        Ok(())
+    }
+
+    /// Finish a capture started by [`Self::begin_capture`].
+    pub fn end_capture(&self) -> Result<CapturedGraph, CudaError> {
+        let graph = self
+            .stream
+            .end_capture(CUgraphInstantiate_flags(0))?
+            .ok_or_else(|| CudaError::new("cuda graph capture produced an empty graph"))?;
+        Ok(CapturedGraph { inner: graph })
+    }
+
+    /// Replay a captured decode step.
+    pub fn launch_graph(&self, graph: &CapturedGraph) -> Result<(), CudaError> {
+        graph.inner.launch()?;
+        Ok(())
+    }
+}
+
 fn function(module: &Arc<CudaModule>, name: &str) -> Result<CudaFunction, CudaError> {
     module
         .load_function(name)
@@ -774,6 +1750,22 @@ mod tests {
             "flint_write_kv",
             "flint_paged_decode",
             "flint_paged_prefill",
+            "flint_residual_rms_f32",
+            "flint_add_rms_f32",
+            "flint_rms_norm_bf16",
+            "flint_rope_bf16",
+            "flint_swiglu_bf16",
+            "flint_add_bf16",
+            "flint_bias_bf16",
+            "flint_embed_bf16",
+            "flint_gather_rows_bf16",
+            "flint_write_kv_bf16",
+            "flint_residual_rms_bf16",
+            "flint_add_rms_bf16",
+            "flint_f32_to_bf16",
+            "flint_paged_decode_bf16",
+            "flint_decode_combine_bf16",
+            "flint_paged_prefill_bf16",
         ] {
             assert!(FLINT_PTX.contains(name), "PTX is missing kernel {name}");
         }
