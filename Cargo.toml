@@ -29,7 +29,7 @@ rayon = "1"
 half = "2"
 safetensors = "0.4"
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
-hf-hub = "0.3"
+hf-hub = "0.4.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
 axum = "0.7"
 rand = "0.8"
