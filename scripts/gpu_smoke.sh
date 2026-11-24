@@ -1,19 +1,45 @@
 #!/usr/bin/env bash
 # GPU smoke test for a fresh NVIDIA box (the intended machine is a RunPod RTX 4090).
 #
-# Installs build tools, Rust, and nvcc when they are missing, builds Flint with
-# `--features cuda`, runs the ignored GPU-vs-CPU tests, serves Qwen2.5-0.5B on
-# the GPU, and prints tokens/s and time-to-first-token at concurrency 1, 8, and 32.
+# Installs build tools, Rust, and nvcc when they are missing, downloads
+# Qwen2.5-0.5B-Instruct, builds Flint with `--features cuda`, runs the ignored
+# GPU-vs-CPU tests whose environment is present, serves the model, and prints
+# tok/s, TTFT, and inter-token latency at concurrency 1, 8, and 32.
 #
 # Usage (on the GPU machine, from anywhere):
 #   bash scripts/gpu_smoke.sh
 # Optional:
 #   FLINT_MODEL_DIR=/path/to/Qwen2.5-0.5B-Instruct
+#   FLINT_HF_LOGITS=/path/to/hf-logits.json
 #   FLINT_PORT=8000
 #   FLINT_MODEL=Qwen/Qwen2.5-0.5B-Instruct
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+KERNEL_STATUS="not run"
+CORE_STATUS="not run"
+BENCH_ROWS=()
+
+summary() {
+  echo
+  echo "================ flint gpu smoke ================"
+  printf "%-12s %s\n" "kernels" "${KERNEL_STATUS}"
+  printf "%-12s %s\n" "core" "${CORE_STATUS}"
+  printf "%-6s %12s %12s %12s %12s\n" "conc" "tok/s" "TTFT p50" "TTFT p99" "ITL p50"
+  if [[ ${#BENCH_ROWS[@]} -eq 0 ]]; then
+    printf "%-6s %12s %12s %12s %12s\n" "-" "-" "-" "-" "-"
+  else
+    local row
+    for row in "${BENCH_ROWS[@]}"; do
+      # shellcheck disable=SC2086
+      printf "%-6s %12s %12s %12s %12s\n" ${row}
+    done
+  fi
+  echo "bench JSON: bench-results/gpu-c{1,8,32}.json"
+  echo "==============================================="
+}
+trap summary EXIT
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "nvidia-smi not found. This script needs an NVIDIA driver and a GPU." >&2
@@ -29,7 +55,8 @@ fi
 
 echo "== packages =="
 $SUDO apt-get update
-$SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y \
+# `env` keeps DEBIAN_FRONTEND set when SUDO is empty (running as root).
+$SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
   build-essential pkg-config libssl-dev curl ca-certificates python3
 
 if ! command -v nvcc >/dev/null 2>&1; then
@@ -37,7 +64,7 @@ if ! command -v nvcc >/dev/null 2>&1; then
     export PATH="/usr/local/cuda/bin:${PATH}"
   else
     echo "nvcc not on PATH; installing nvidia-cuda-toolkit (or use a RunPod image that already has the CUDA toolkit)."
-    $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-cuda-toolkit
+    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-cuda-toolkit
   fi
 fi
 nvcc --version
@@ -61,36 +88,75 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 rustc --version
 
+echo "== model snapshot =="
+MODEL_ID="${FLINT_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
+if [[ -z "${FLINT_MODEL_DIR:-}" ]]; then
+  FLINT_MODEL_DIR="${PWD}/models/${MODEL_ID//\//--}"
+  export FLINT_MODEL_DIR
+fi
+mkdir -p "${FLINT_MODEL_DIR}"
+HF_BASE="https://huggingface.co/${MODEL_ID}/resolve/main"
+download_one() {
+  local name="$1"
+  local required="$2"
+  if [[ -s "${FLINT_MODEL_DIR}/${name}" ]]; then
+    return 0
+  fi
+  if curl -fL --retry 3 --retry-delay 2 -o "${FLINT_MODEL_DIR}/${name}" "${HF_BASE}/${name}"; then
+    return 0
+  fi
+  rm -f "${FLINT_MODEL_DIR}/${name}"
+  if [[ "${required}" == "required" ]]; then
+    echo "failed to download ${name} from ${HF_BASE}" >&2
+    return 1
+  fi
+}
+download_one config.json required
+download_one tokenizer.json required
+download_one model.safetensors required
+download_one tokenizer_config.json optional
+download_one generation_config.json optional
+echo "FLINT_MODEL_DIR=${FLINT_MODEL_DIR}"
+
 echo "== GPU correctness tests (release) =="
-cargo test --release -p flint-kernels --features cuda -- --ignored --test-threads=1
-cargo test --release -p flint-core --features cuda -- --ignored --test-threads=1
+if cargo test --release -p flint-kernels --features cuda -- --ignored --test-threads=1; then
+  KERNEL_STATUS="PASS"
+else
+  KERNEL_STATUS="FAIL"
+fi
+
+CORE_SKIP=()
+if [[ -z "${FLINT_HF_LOGITS:-}" ]]; then
+  CORE_SKIP+=(--skip compare_against_hf_logits_file)
+fi
+if cargo test --release -p flint-core --features cuda -- --ignored --test-threads=1 "${CORE_SKIP[@]}"; then
+  CORE_STATUS="PASS"
+else
+  CORE_STATUS="FAIL"
+fi
 
 echo "== server and bench =="
 cargo build --release -p flint-server --features cuda
 cargo build --release -p flint-bench
 
 PORT="${FLINT_PORT:-8000}"
-MODEL_ARGS=()
-if [[ -n "${FLINT_MODEL_DIR:-}" ]]; then
-  MODEL_ARGS=(--model-dir "${FLINT_MODEL_DIR}")
-fi
-
 ./target/release/flint serve \
   --device cuda \
+  --dtype bf16 \
   --host 127.0.0.1 \
   --port "${PORT}" \
+  --model-dir "${FLINT_MODEL_DIR}" \
   --max-num-seqs 32 \
   --max-batched-tokens 4096 \
   --num-blocks 512 \
-  "${MODEL_ARGS[@]}" \
   >/tmp/flint-gpu-serve.log 2>&1 &
 SERVER_PID=$!
 cleanup() {
   kill "${SERVER_PID}" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
+trap 'cleanup; summary' EXIT
 
-echo "waiting for http://127.0.0.1:${PORT}/health (model download and GPU upload can take a few minutes)"
+echo "waiting for http://127.0.0.1:${PORT}/health (GPU weight upload can take a minute)"
 ready=0
 for _ in $(seq 1 300); do
   if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null; then
@@ -111,7 +177,6 @@ if [[ "${ready}" -ne 1 ]]; then
 fi
 
 mkdir -p bench-results
-MODEL_NAME="${FLINT_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
 for c in 1 8 32; do
   reqs=8
   if [[ "${c}" -gt 8 ]]; then
@@ -120,7 +185,7 @@ for c in 1 8 32; do
   echo "== bench concurrency ${c} =="
   ./target/release/flint-bench \
     --url "http://127.0.0.1:${PORT}" \
-    --model "${MODEL_NAME}" \
+    --model "${MODEL_ID}" \
     --endpoint completions \
     --concurrency "${c}" \
     --requests "${reqs}" \
@@ -130,14 +195,26 @@ for c in 1 8 32; do
     --prompt "Hello, my name is" \
     --prompt "The capital of France is" \
     --json-out "bench-results/gpu-c${c}.json"
-  python3 - "${c}" <<'PY'
+  row="$(python3 - "${c}" <<'PY'
 import json, sys
 c = sys.argv[1]
 report = json.load(open(f"bench-results/gpu-c{c}.json"))
 ttft = report["ttft_ms"]
+itl = report.get("itl_ms") or {}
+itl_p50 = itl.get("p50")
+itl_s = "-" if itl_p50 is None else f"{itl_p50:.1f}"
+print(f"{report['throughput_tok_s']:.2f} {ttft['p50']:.1f} {ttft['p99']:.1f} {itl_s}")
 print(
     f"concurrency {c}: tok/s={report['throughput_tok_s']:.2f}  "
-    f"TTFT p50={ttft['p50']:.1f} ms  TTFT p99={ttft['p99']:.1f} ms"
+    f"TTFT p50={ttft['p50']:.1f} ms  TTFT p99={ttft['p99']:.1f} ms  "
+    f"ITL p50={itl_s} ms",
+    file=sys.stderr,
 )
 PY
+)"
+  BENCH_ROWS+=("${c} ${row}")
 done
+
+if [[ "${KERNEL_STATUS}" != "PASS" || "${CORE_STATUS}" != "PASS" ]]; then
+  exit 1
+fi
