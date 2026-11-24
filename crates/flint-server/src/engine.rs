@@ -201,24 +201,45 @@ pub(crate) enum ExecDevice {
     Cuda,
 }
 
+/// Storage for a CUDA model. The CPU path is always f32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecDType {
+    /// Full precision. This is the GPU parity path.
+    F32,
+    /// bf16 weights and activations, f32 accumulation.
+    Bf16,
+}
+
 /// Box the loaded model for the engine thread.
 pub(crate) fn into_engine_model(
     model: Model,
     device: ExecDevice,
+    dtype: ExecDType,
     num_blocks: usize,
     block_size: usize,
 ) -> Result<Box<dyn LanguageModel>, Error> {
     match device {
-        ExecDevice::Cpu => Ok(Box::new(model)),
+        ExecDevice::Cpu => {
+            if dtype == ExecDType::Bf16 {
+                return Err(Error::Inference(
+                    "--dtype bf16 requires --device cuda".into(),
+                ));
+            }
+            Ok(Box::new(model))
+        }
         ExecDevice::Cuda => {
             #[cfg(feature = "cuda")]
             {
-                let gpu = model.into_gpu(num_blocks, block_size)?;
+                let gpu_dtype = match dtype {
+                    ExecDType::F32 => flint_core::GpuDType::F32,
+                    ExecDType::Bf16 => flint_core::GpuDType::Bf16,
+                };
+                let gpu = model.into_gpu_with(num_blocks, block_size, gpu_dtype)?;
                 Ok(Box::new(CudaModel { inner: gpu }))
             }
             #[cfg(not(feature = "cuda"))]
             {
-                let _ = (model, num_blocks, block_size);
+                let _ = (model, dtype, num_blocks, block_size);
                 Err(Error::Inference(
                     "--device cuda requires rebuilding flint with `--features cuda`".into(),
                 ))
