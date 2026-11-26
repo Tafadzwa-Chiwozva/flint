@@ -22,6 +22,7 @@ mod model;
 mod ops;
 mod quant;
 mod sampling;
+mod speculative;
 mod tokenizer;
 mod weights;
 
@@ -34,4 +35,8 @@ pub use gpu::GpuModel;
 pub use model::{ForwardChunk, ForwardOutput, Model};
 pub use quant::QuantMode;
 pub use sampling::{sample, SamplingParams};
+pub use speculative::{
+    accept_greedy, accept_stochastic, draft_propose, ensure_draft_compatible, keep_kv_len,
+    plan_verify, AcceptDecision, DraftStart, Proposal, SpecModel, SpeculativeStats, VerifyPlan,
+};
 pub use tokenizer::{apply_qwen_chat_template, ChatTurn, FlintTokenizer};

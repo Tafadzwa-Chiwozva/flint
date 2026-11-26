@@ -327,6 +327,7 @@ async fn collect(mut submission: Submission) -> Result<Collected, ApiFailure> {
                 reason,
                 prompt_tokens,
                 completion_tokens,
+                ..
             } => {
                 return Ok(Collected {
                     text,
@@ -441,7 +442,7 @@ fn stream_response(
                     role_sent = true;
                     yield Ok(Event::default().data(payload));
                 }
-                EngineEvent::Done { reason, prompt_tokens, completion_tokens } => {
+                EngineEvent::Done { reason, prompt_tokens, completion_tokens, .. } => {
                     let payload = chunk_json(
                         ChunkHeader { id: &id, created, model: &model, kind },
                         None,
@@ -744,6 +745,7 @@ mod tests {
         let codec: Arc<dyn TextCodec> = Arc::new(CharCodec);
         let (engine, _thread) = spawn(
             model,
+            None,
             Arc::clone(&codec),
             num_blocks,
             4,
