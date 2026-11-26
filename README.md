@@ -221,7 +221,7 @@ for each layer:
 logits: final RMSNorm and the LM head, only for sequences that sample
 ```
 
-Block tables, positions, and token ids stay in device buffers and are overwritten in place when they fit, so a decode step does not allocate them again. A pure decode whose batch size is 1, 2, 4, 8, 16, 32, or 64 is captured as a CUDA graph after the first eager step of that size and replayed after that. Other shapes, and a capture that the driver rejects, stay eager.
+Block tables, positions, and token ids stay in device buffers and are overwritten in place when they fit, so a decode step does not allocate them again. A pure decode whose batch size is 1, 2, 4, 8, 16, 32, or 64 is captured as a CUDA graph after the first eager step of that size and replayed after that. Capture runs on a non-blocking stream with a preallocated cuBLAS workspace. The legacy default stream cannot be captured, and a GEMM on it waits for every other blocking stream. Other shapes, and a capture that the driver rejects, stay eager.
 
 The kernels live in `kernels/ops.cu`. `build.rs` compiles them to PTX with `nvcc -ptx` when `--features cuda` is on, and `cudarc` loads that PTX with the driver API at runtime. Compiling the feature needs `nvcc`. Running it needs a GPU, `libcuda`, and `libcublas`. A machine without the toolkit never builds this path: the feature is off by default, and `build.rs` is a no-op then.
 
@@ -238,7 +238,7 @@ On a fresh RunPod RTX 4090 (driver installed, repo checked out):
 bash scripts/gpu_smoke.sh
 ```
 
-The script installs build tools, Rust 1.100, and `nvcc` if they are missing, downloads the model (curl follows the relative Hugging Face redirect), exports `FLINT_MODEL_DIR`, and runs the ignored GPU tests whose inputs are present. The Hugging Face logit file is skipped unless `FLINT_HF_LOGITS` is set. It then serves `Qwen/Qwen2.5-0.5B-Instruct` twice, `--dtype bf16 --quant none` and `--dtype bf16 --quant int8`, and writes `bench-results/gpu-{bf16,int8}-c{1,8,32}.json`. The exit trap prints a table of test status plus tok/s, TTFT p50/p99, and inter-token latency for both weight formats at concurrency 1, 8, and 32. Serve the same way by hand:
+The script installs build tools, Rust 1.100, and `nvcc` if they are missing, downloads the model (curl follows the relative Hugging Face redirect), exports `FLINT_MODEL_DIR`, and runs the ignored GPU tests whose inputs are present. The Hugging Face logit file is skipped unless `FLINT_HF_LOGITS` is set. It then serves `Qwen/Qwen2.5-0.5B-Instruct` twice, `--dtype bf16 --quant none` and `--dtype bf16 --quant int8`, writing server logs to `/tmp/flint-gpu-serve-bf16.log` and `/tmp/flint-gpu-serve-int8.log`, and writes `bench-results/gpu-{bf16,int8}-c{1,8,32}.json`. The exit trap prints a table of test status, whether CUDA graphs stayed enabled in each mode, plus tok/s, TTFT p50/p99, and inter-token latency for both weight formats at concurrency 1, 8, and 32. The script exits non-zero when a mode disables graphs. Serve the same way by hand:
 
 ```bash
 cargo build --release -p flint-server --features cuda
@@ -253,7 +253,7 @@ What this chunk does not do: flash-attention tuning, 4-bit weights, speculative 
 
 `--quant none` (the default) is unchanged. `--quant int8` quantizes every linear weight at load: Q, K, V, the attention output, the SwiGLU gate/up/down projections, and the LM head. A tied head is the embedding matrix, so that matrix is quantized and embedding lookup dequantizes the row. An untied embedding table stays f32. Norms and biases stay full precision.
 
-Each output channel uses one f32 scale, `max(|row|) / 127`, and stores symmetric `i8` codes in `[-127, 127]`. The matmul is W8A32: `scale * sum(x * q)` accumulated in f32. On CPU that dot runs in the existing GEMM. On CUDA, batches of 64 rows or fewer (every captured decode width) use a fused dequant GEMV. Larger prefill rows dequantize a 2048-channel tile into scratch and call cuBLAS, so the decode graph never allocates. INT8 weights are about half the bytes of bf16 and a quarter of f32, plus one scale per output channel.
+Each output channel uses one f32 scale, `max(|row|) / 127`, and stores symmetric `i8` codes in `[-127, 127]`. The matmul is W8A32: `scale * sum(x * q)` accumulated in f32. On CPU that dot runs in the existing GEMM. On CUDA, batches of 64 rows or fewer (every captured decode width) use a fused dequant GEMV, so the decode graph never calls cuBLAS. Larger prefill rows dequantize the whole matrix into scratch and call cuBLAS once. A scratch that cannot hold the matrix falls back to spans that fit. INT8 weights are about half the bytes of bf16 and a quarter of f32, plus one scale per output channel.
 
 ```bash
 cargo run --release -p flint-server -- serve --quant int8 --model-dir models/Qwen2.5-0.5B-Instruct
