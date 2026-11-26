@@ -198,7 +198,7 @@ Inter-token latency is the gap between SSE events that carry text. At concurrenc
 - The engine executes a scheduled batch one sequence at a time. There is no cross-sequence fused GEMM on CPU.
 - Preemption recomputes. It does not swap KV to a side buffer.
 - Block refcounts and copy-on-write are ready for prefix sharing. The scheduler does not use them yet.
-- The CPU path widens weights to f32. There is no 4-bit or 8-bit matmul. CUDA can keep weights and activations in bf16 (see Phase 2).
+- The CPU path widens weights to f32 unless `--quant int8` is set. There is no 4-bit matmul. CUDA can keep activations in bf16 (see Phase 2) and linear weights in INT8 (see Phase 3).
 - `--device cuda` (see Phase 2) is off unless the binary is built with `--features cuda`. The default build and the default CI job stay CPU-only.
 - No speculative decoding, no repetition penalty, no tool calls. `n` other than 1 is rejected; concurrency is multiple HTTP requests.
 - Detokenization decodes the full generated prefix each step. Stop-string filtering then decides how much of the new suffix is safe to emit.
@@ -207,7 +207,7 @@ Inter-token latency is the gap between SSE events that carry text. At concurrenc
 
 `--device cpu` stays the default and does not change the phase-1 math. `--device cuda` uploads the weights once, keeps K and V in a device buffer with the same block layout as the host cache, and runs each scheduler step as one batched forward.
 
-`--dtype auto` (the default) is f32 on CPU and bf16 on CUDA. `--dtype f32` forces the pedantic parity path on CUDA. `--dtype bf16` is rejected on CPU. bf16 mode stores weights, activations, and KV as bf16 and accumulates GEMMs in f32 on tensor cores (`cublasGemmEx` with `CUBLAS_COMPUTE_32F`). Logits stay f32. The f32 mode keeps `CUBLAS_PEDANTIC_MATH` so Ampere/Ada TF32 does not change the comparison against the CPU oracle.
+`--dtype auto` (the default) is f32 on CPU and bf16 on CUDA. `--dtype f32` forces the pedantic parity path on CUDA. `--dtype bf16` is rejected on CPU. bf16 mode stores activations and KV as bf16 and accumulates GEMMs in f32 on tensor cores (`cublasGemmEx` with `CUBLAS_COMPUTE_32F`). Logits stay f32. The f32 mode keeps `CUBLAS_PEDANTIC_MATH` so Ampere/Ada TF32 does not change the comparison against the CPU oracle. `--quant int8` is orthogonal: linear weights are per-channel INT8 in either dtype, and unquantized weights follow `--dtype`.
 
 ```text
 tokens in the step are concatenated into one row batch
@@ -238,22 +238,34 @@ On a fresh RunPod RTX 4090 (driver installed, repo checked out):
 bash scripts/gpu_smoke.sh
 ```
 
-The script installs build tools, Rust 1.100, and `nvcc` if they are missing, downloads the model (curl follows the relative Hugging Face redirect), exports `FLINT_MODEL_DIR`, and runs the ignored GPU tests whose inputs are present. The Hugging Face logit file is skipped unless `FLINT_HF_LOGITS` is set. It then serves `Qwen/Qwen2.5-0.5B-Instruct` with `--device cuda --dtype bf16` and writes `bench-results/gpu-c{1,8,32}.json`. The exit trap prints a table of test status plus tok/s, TTFT p50/p99, and inter-token latency at concurrency 1, 8, and 32. Serve the same way by hand:
+The script installs build tools, Rust 1.100, and `nvcc` if they are missing, downloads the model (curl follows the relative Hugging Face redirect), exports `FLINT_MODEL_DIR`, and runs the ignored GPU tests whose inputs are present. The Hugging Face logit file is skipped unless `FLINT_HF_LOGITS` is set. It then serves `Qwen/Qwen2.5-0.5B-Instruct` twice, `--dtype bf16 --quant none` and `--dtype bf16 --quant int8`, and writes `bench-results/gpu-{bf16,int8}-c{1,8,32}.json`. The exit trap prints a table of test status plus tok/s, TTFT p50/p99, and inter-token latency for both weight formats at concurrency 1, 8, and 32. Serve the same way by hand:
 
 ```bash
 cargo build --release -p flint-server --features cuda
-./target/release/flint serve --device cuda --dtype bf16 \
+./target/release/flint serve --device cuda --dtype bf16 --quant int8 \
   --model-dir models/Qwen--Qwen2.5-0.5B-Instruct \
   --max-num-seqs 32 --num-blocks 512
 ```
 
-What this chunk does not do: flash-attention tuning, quantization, speculative decoding, and scheduler prefix caching. The host `PagedKvCache` is still allocated beside the device cache; the GPU model does not read it. Prefill attention is a correct causal walk over the block table, not a fused flash kernel.
+What this chunk does not do: flash-attention tuning, 4-bit weights, speculative decoding, and scheduler prefix caching. The host `PagedKvCache` is still allocated beside the device cache; the GPU model does not read it. Prefill attention is a correct causal walk over the block table, not a fused flash kernel.
+
+## Phase 3 — INT8 weight-only quantization
+
+`--quant none` (the default) is unchanged. `--quant int8` quantizes every linear weight at load: Q, K, V, the attention output, the SwiGLU gate/up/down projections, and the LM head. A tied head is the embedding matrix, so that matrix is quantized and embedding lookup dequantizes the row. An untied embedding table stays f32. Norms and biases stay full precision.
+
+Each output channel uses one f32 scale, `max(|row|) / 127`, and stores symmetric `i8` codes in `[-127, 127]`. The matmul is W8A32: `scale * sum(x * q)` accumulated in f32. On CPU that dot runs in the existing GEMM. On CUDA, batches of 64 rows or fewer (every captured decode width) use a fused dequant GEMV. Larger prefill rows dequantize a 2048-channel tile into scratch and call cuBLAS, so the decode graph never allocates. INT8 weights are about half the bytes of bf16 and a quarter of f32, plus one scale per output channel.
+
+```bash
+cargo run --release -p flint-server -- serve --quant int8 --model-dir models/Qwen2.5-0.5B-Instruct
+cargo run --release -p flint-server --features cuda -- serve \
+  --device cuda --dtype bf16 --quant int8 --model-dir models/Qwen2.5-0.5B-Instruct
+```
 
 ## Roadmap
 
 **Phase 2 — rest of GPU execution.** Flash-style attention for long prefills, scheduler prefix sharing on the device cache, and dropping the unused host KV allocation. The CPU path stays the oracle.
 
-**Phase 3 — the comparison that the project is for.** Speculative decoding with a small draft model, 8-bit and 4-bit weight quantization, and `flint-bench` against vLLM and llama.cpp server on RTX 4090, A100, and H100. Report tokens per second, time to first token, and cost per million tokens from the same JSON the harness already writes.
+**Phase 3 — the comparison that the project is for.** Weight-only INT8 is in (`--quant int8` on CPU and CUDA). Still open: 4-bit weights, speculative decoding with a small draft model, and `flint-bench` against vLLM and llama.cpp server on RTX 4090, A100, and H100. Report tokens per second, time to first token, and cost per million tokens from the same JSON the harness already writes.
 
 ## Development
 

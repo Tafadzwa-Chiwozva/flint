@@ -52,6 +52,30 @@ struct Args {
     /// Write the CSV summary here.
     #[arg(long)]
     csv_out: Option<PathBuf>,
+    /// Label for the server's `--quant` mode, stored on the JSON report.
+    ///
+    /// This client does not load weights. Start `flint serve` with the same
+    /// value (`none` or `int8`).
+    #[arg(long, value_enum, default_value = "none")]
+    quant: QuantKind,
+}
+
+/// Matches `flint serve --quant`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum QuantKind {
+    /// Full-precision weights.
+    None,
+    /// Per-channel symmetric INT8 weights.
+    Int8,
+}
+
+impl QuantKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Int8 => "int8",
+        }
+    }
 }
 
 #[tokio::main]
@@ -86,6 +110,7 @@ async fn run_cli() -> anyhow::Result<()> {
         api_key: args.api_key,
         timeout: Duration::from_secs(args.timeout_secs),
         endpoint,
+        quant: args.quant.as_str().to_string(),
     })
     .await?;
     println!("{}", serde_json::to_string_pretty(&report)?);

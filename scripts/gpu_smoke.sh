@@ -3,8 +3,9 @@
 #
 # Installs build tools, Rust, and nvcc when they are missing, downloads
 # Qwen2.5-0.5B-Instruct, builds Flint with `--features cuda`, runs the ignored
-# GPU-vs-CPU tests whose environment is present, serves the model, and prints
-# tok/s, TTFT, and inter-token latency at concurrency 1, 8, and 32.
+# GPU-vs-CPU tests whose environment is present, serves the model twice
+# (`--dtype bf16` and `--dtype bf16 --quant int8`), and prints tok/s, TTFT,
+# and inter-token latency at concurrency 1, 8, and 32 for both.
 #
 # Usage (on the GPU machine, from anywhere):
 #   bash scripts/gpu_smoke.sh
@@ -26,17 +27,17 @@ summary() {
   echo "================ flint gpu smoke ================"
   printf "%-12s %s\n" "kernels" "${KERNEL_STATUS}"
   printf "%-12s %s\n" "core" "${CORE_STATUS}"
-  printf "%-6s %12s %12s %12s %12s\n" "conc" "tok/s" "TTFT p50" "TTFT p99" "ITL p50"
+  printf "%-8s %-6s %12s %12s %12s %12s\n" "weights" "conc" "tok/s" "TTFT p50" "TTFT p99" "ITL p50"
   if [[ ${#BENCH_ROWS[@]} -eq 0 ]]; then
-    printf "%-6s %12s %12s %12s %12s\n" "-" "-" "-" "-" "-"
+    printf "%-8s %-6s %12s %12s %12s %12s\n" "-" "-" "-" "-" "-" "-"
   else
     local row
     for row in "${BENCH_ROWS[@]}"; do
       # shellcheck disable=SC2086
-      printf "%-6s %12s %12s %12s %12s\n" ${row}
+      printf "%-8s %-6s %12s %12s %12s %12s\n" ${row}
     done
   fi
-  echo "bench JSON: bench-results/gpu-c{1,8,32}.json"
+  echo "bench JSON: bench-results/gpu-{bf16,int8}-c{1,8,32}.json"
   echo "==============================================="
 }
 trap summary EXIT
@@ -140,80 +141,103 @@ cargo build --release -p flint-server --features cuda
 cargo build --release -p flint-bench
 
 PORT="${FLINT_PORT:-8000}"
-./target/release/flint serve \
-  --device cuda \
-  --dtype bf16 \
-  --host 127.0.0.1 \
-  --port "${PORT}" \
-  --model-dir "${FLINT_MODEL_DIR}" \
-  --max-num-seqs 32 \
-  --max-batched-tokens 4096 \
-  --num-blocks 512 \
-  >/tmp/flint-gpu-serve.log 2>&1 &
-SERVER_PID=$!
+SERVER_PID=""
 cleanup() {
-  kill "${SERVER_PID}" >/dev/null 2>&1 || true
+  if [[ -n "${SERVER_PID}" ]]; then
+    kill "${SERVER_PID}" >/dev/null 2>&1 || true
+    wait "${SERVER_PID}" >/dev/null 2>&1 || true
+    SERVER_PID=""
+  fi
 }
 trap 'cleanup; summary' EXIT
 
-echo "waiting for http://127.0.0.1:${PORT}/health (GPU weight upload can take a minute)"
-ready=0
-for _ in $(seq 1 300); do
-  if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null; then
-    ready=1
-    break
-  fi
-  if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
-    echo "flint serve exited. Log:" >&2
+wait_healthy() {
+  local port="$1"
+  echo "waiting for http://127.0.0.1:${port}/health (GPU weight upload can take a minute)"
+  local ready=0
+  for _ in $(seq 1 300); do
+    if curl -sf "http://127.0.0.1:${port}/health" >/dev/null; then
+      ready=1
+      break
+    fi
+    if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
+      echo "flint serve exited. Log:" >&2
+      cat /tmp/flint-gpu-serve.log >&2
+      exit 1
+    fi
+    sleep 2
+  done
+  if [[ "${ready}" -ne 1 ]]; then
+    echo "server did not become healthy. Log:" >&2
     cat /tmp/flint-gpu-serve.log >&2
     exit 1
   fi
-  sleep 2
-done
-if [[ "${ready}" -ne 1 ]]; then
-  echo "server did not become healthy. Log:" >&2
-  cat /tmp/flint-gpu-serve.log >&2
-  exit 1
-fi
+}
 
-mkdir -p bench-results
-for c in 1 8 32; do
-  reqs=8
-  if [[ "${c}" -gt 8 ]]; then
-    reqs="${c}"
-  fi
-  echo "== bench concurrency ${c} =="
-  ./target/release/flint-bench \
-    --url "http://127.0.0.1:${PORT}" \
-    --model "${MODEL_ID}" \
-    --endpoint completions \
-    --concurrency "${c}" \
-    --requests "${reqs}" \
-    --warmup 1 \
-    --max-tokens 32 \
-    --temperature 0 \
-    --prompt "Hello, my name is" \
-    --prompt "The capital of France is" \
-    --json-out "bench-results/gpu-c${c}.json"
-  row="$(python3 - "${c}" <<'PY'
+# label is the summary-table name. quant is the server and bench flag.
+bench_mode() {
+  local label="$1"
+  local quant="$2"
+  cleanup
+  echo "== serve ${label} (dtype bf16, quant ${quant}) =="
+  ./target/release/flint serve \
+    --device cuda \
+    --dtype bf16 \
+    --quant "${quant}" \
+    --host 127.0.0.1 \
+    --port "${PORT}" \
+    --model-dir "${FLINT_MODEL_DIR}" \
+    --max-num-seqs 32 \
+    --max-batched-tokens 4096 \
+    --num-blocks 512 \
+    >/tmp/flint-gpu-serve.log 2>&1 &
+  SERVER_PID=$!
+  wait_healthy "${PORT}"
+  local c reqs row
+  for c in 1 8 32; do
+    reqs=8
+    if [[ "${c}" -gt 8 ]]; then
+      reqs="${c}"
+    fi
+    echo "== bench ${label} concurrency ${c} =="
+    ./target/release/flint-bench \
+      --url "http://127.0.0.1:${PORT}" \
+      --model "${MODEL_ID}" \
+      --endpoint completions \
+      --concurrency "${c}" \
+      --requests "${reqs}" \
+      --warmup 1 \
+      --max-tokens 32 \
+      --temperature 0 \
+      --quant "${quant}" \
+      --prompt "Hello, my name is" \
+      --prompt "The capital of France is" \
+      --json-out "bench-results/gpu-${label}-c${c}.json"
+    row="$(python3 - "${label}" "${c}" <<'PY'
 import json, sys
-c = sys.argv[1]
-report = json.load(open(f"bench-results/gpu-c{c}.json"))
+label, c = sys.argv[1], sys.argv[2]
+report = json.load(open(f"bench-results/gpu-{label}-c{c}.json"))
 ttft = report["ttft_ms"]
 itl = report.get("itl_ms") or {}
 itl_p50 = itl.get("p50")
 itl_s = "-" if itl_p50 is None else f"{itl_p50:.1f}"
 print(f"{report['throughput_tok_s']:.2f} {ttft['p50']:.1f} {ttft['p99']:.1f} {itl_s}")
 print(
-    f"concurrency {c}: tok/s={report['throughput_tok_s']:.2f}  "
+    f"{label} concurrency {c}: tok/s={report['throughput_tok_s']:.2f}  "
     f"TTFT p50={ttft['p50']:.1f} ms  TTFT p99={ttft['p99']:.1f} ms  "
     f"ITL p50={itl_s} ms",
     file=sys.stderr,
 )
 PY
 )"
-  BENCH_ROWS+=("${c} ${row}")
-done
+    BENCH_ROWS+=("${label} ${c} ${row}")
+  done
+  cleanup
+}
+
+mkdir -p bench-results
+bench_mode bf16 none
+bench_mode int8 int8
 
 if [[ "${KERNEL_STATUS}" != "PASS" || "${CORE_STATUS}" != "PASS" ]]; then
   exit 1

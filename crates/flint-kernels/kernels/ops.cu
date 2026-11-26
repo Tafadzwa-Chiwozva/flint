@@ -582,3 +582,4 @@ extern "C" __global__ void flint_paged_prefill(
 }
 
 #include "bf16_ext.cu"
+#include "int8.cu"

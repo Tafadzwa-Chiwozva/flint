@@ -13,6 +13,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=kernels/ops.cu");
     println!("cargo:rerun-if-changed=kernels/bf16_ext.cu");
+    println!("cargo:rerun-if-changed=kernels/int8.cu");
     println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");

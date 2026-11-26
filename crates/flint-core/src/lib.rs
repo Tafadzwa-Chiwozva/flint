@@ -6,8 +6,10 @@
 //! Attention reads and writes a [`flint_kv::PagedKvCache`], which is the same
 //! cache the HTTP engine serves from.
 //!
-//! The CPU path is f32 and is the oracle. With `--features cuda`, `GpuModel`
-//! uploads those same weights and runs the forward pass on device.
+//! The CPU path is f32 and is the oracle. `--quant int8` stores linear weights
+//! as per-channel INT8 and dequantizes them inside the matmul. With
+//! `--features cuda`, `GpuModel` uploads those same weights and runs the
+//! forward pass on device.
 
 #![deny(missing_docs)]
 
@@ -18,6 +20,7 @@ mod gemm;
 mod gpu;
 mod model;
 mod ops;
+mod quant;
 mod sampling;
 mod tokenizer;
 mod weights;
@@ -29,5 +32,6 @@ pub use flint_kernels::cuda::GpuDType;
 #[cfg(feature = "cuda")]
 pub use gpu::GpuModel;
 pub use model::{ForwardChunk, ForwardOutput, Model};
+pub use quant::QuantMode;
 pub use sampling::{sample, SamplingParams};
 pub use tokenizer::{apply_qwen_chat_template, ChatTurn, FlintTokenizer};
