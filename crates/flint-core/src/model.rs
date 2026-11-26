@@ -408,6 +408,51 @@ impl Model {
         block_table: &[u32],
         want_logits: bool,
     ) -> Result<ForwardOutput, Error> {
+        let chunk = self.run_layers(tokens, position, cache, block_table)?;
+        if !want_logits {
+            return Ok(ForwardOutput {
+                last_hidden: None,
+                logits: None,
+            });
+        }
+        let (last_hidden, logits) = self.project_last(chunk)?;
+        Ok(ForwardOutput {
+            last_hidden: Some(last_hidden),
+            logits: Some(logits),
+        })
+    }
+
+    /// Logits for one chunk.
+    ///
+    /// `all_positions` projects every token in the chunk, which is the target
+    /// model's speculative verification pass: `K` draft tokens produce `K`
+    /// logit vectors from this single forward (the caller prepends the logits
+    /// it already has for the prefix when it needs `K + 1`). Otherwise only
+    /// the last token is projected, matching [`Self::forward`].
+    pub fn forward_token_logits(
+        &mut self,
+        tokens: &[u32],
+        position: usize,
+        cache: &mut PagedKvCache,
+        block_table: &[u32],
+        all_positions: bool,
+    ) -> Result<Vec<Vec<f32>>, Error> {
+        let chunk = self.run_layers(tokens, position, cache, block_table)?;
+        if all_positions {
+            self.project_all(chunk)
+        } else {
+            let (_hidden, logits) = self.project_last(chunk)?;
+            Ok(vec![logits])
+        }
+    }
+
+    fn run_layers(
+        &mut self,
+        tokens: &[u32],
+        position: usize,
+        cache: &mut PagedKvCache,
+        block_table: &[u32],
+    ) -> Result<usize, Error> {
         if tokens.is_empty() {
             return Err(Error::Inference("forward chunk is empty".into()));
         }
@@ -458,13 +503,12 @@ impl Model {
                 &args,
             )?;
         }
+        Ok(chunk)
+    }
 
-        if !want_logits {
-            return Ok(ForwardOutput {
-                last_hidden: None,
-                logits: None,
-            });
-        }
+    fn project_last(&mut self, chunk: usize) -> Result<(Vec<f32>, Vec<f32>), Error> {
+        let hidden = self.cfg.hidden_size;
+        let eps = self.cfg.rms_norm_eps as f32;
         let start = (chunk - 1) * hidden;
         rms_norm(
             &mut self.scratch.normed[..hidden],
@@ -486,10 +530,28 @@ impl Model {
                 hidden,
             );
         }
-        Ok(ForwardOutput {
-            last_hidden: Some(last_hidden),
-            logits: Some(logits),
-        })
+        Ok((last_hidden, logits))
+    }
+
+    fn project_all(&mut self, chunk: usize) -> Result<Vec<Vec<f32>>, Error> {
+        let hidden = self.cfg.hidden_size;
+        let vocab = self.cfg.vocab_size;
+        let eps = self.cfg.rms_norm_eps as f32;
+        let width = chunk * hidden;
+        rms_norm(
+            &mut self.scratch.normed[..width],
+            &self.scratch.hidden[..width],
+            &self.final_norm,
+            eps,
+        );
+        let normed = self.scratch.normed[..width].to_vec();
+        let mut flat = vec![0.0; chunk * vocab];
+        if let Some(head) = &self.lm_head {
+            head.apply(&normed, &mut flat, chunk);
+        } else {
+            apply_packed(&self.embed, &normed, &mut flat, chunk, vocab, hidden);
+        }
+        Ok(flat.chunks(vocab).map(|row| row.to_vec()).collect())
     }
 
     fn ensure_scratch(&mut self, chunk: usize) {

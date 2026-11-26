@@ -6,13 +6,14 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use flint_core::{
-    apply_qwen_chat_template, ChatTurn, Error, FlintTokenizer, Model, ModelConfig, QuantMode,
-    SamplingParams,
+    apply_qwen_chat_template, ensure_draft_compatible, ChatTurn, Error, FlintTokenizer, Model,
+    ModelConfig, QuantMode, SamplingParams,
 };
 use hf_hub::api::sync::Api;
 
 use crate::engine::{
-    into_engine_model, spawn, EngineEvent, ExecDType, ExecDevice, FinishReason, TextCodec,
+    into_engine_model, spawn, DraftSpec, EngineEvent, ExecDType, ExecDevice, FinishReason,
+    LanguageModel, TextCodec,
 };
 use crate::http::{router, AppState};
 use crate::serve_runtime;
@@ -160,10 +161,39 @@ struct ModelArgs {
     quant: QuantKind,
 }
 
+/// Draft-model speculative decoding. Omit `--draft-model` to disable it.
+#[derive(Parser, Clone)]
+struct SpecArgs {
+    /// Draft model. A local directory with `config.json`, or a Hugging Face repo id.
+    #[arg(long)]
+    draft_model: Option<String>,
+    /// Draft linear-weight quantization.
+    ///
+    /// When this is omitted, an INT8 target keeps INT8 draft weights and every
+    /// other target uses INT8 for the draft.
+    #[arg(long, value_enum)]
+    draft_quant: Option<QuantKind>,
+    /// Draft tokens proposed on each speculative step.
+    #[arg(long, default_value_t = 4)]
+    speculative_tokens: usize,
+}
+
+fn resolve_draft_quant(target: QuantKind, explicit: Option<QuantKind>) -> QuantKind {
+    if let Some(mode) = explicit {
+        return mode;
+    }
+    match target {
+        QuantKind::None => QuantKind::Int8,
+        other => other,
+    }
+}
+
 #[derive(Parser)]
 struct ServeArgs {
     #[command(flatten)]
     model: ModelArgs,
+    #[command(flatten)]
+    spec: SpecArgs,
     /// Address to bind.
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -200,6 +230,8 @@ struct ServeArgs {
 struct GenerateArgs {
     #[command(flatten)]
     model: ModelArgs,
+    #[command(flatten)]
+    spec: SpecArgs,
     /// Raw prompt. Omit when using `--chat`.
     #[arg(long)]
     prompt: Option<String>,
@@ -264,19 +296,18 @@ pub async fn cli() -> anyhow::Result<()> {
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     require_device(args.model.device)?;
     let dtype = resolve_dtype(args.model.device, args.model.dtype)?;
-    let (model, codec, model_name) = load_pair(&args.model)?;
     let num_blocks = args.num_blocks;
     let block_size = args.block_size;
-    let model = into_engine_model(
-        model,
-        args.model.device.exec(),
-        dtype,
-        num_blocks,
-        block_size,
-    )?;
+    let PreparedModels {
+        target: model,
+        draft,
+        codec,
+        name: model_name,
+    } = prepare_models(&args.model, &args.spec, dtype, num_blocks, block_size)?;
     tracing::info!(device = ?args.model.device, "forward device");
     let (engine, thread) = spawn(
         model,
+        draft,
         Arc::clone(&codec),
         num_blocks,
         block_size,
@@ -313,10 +344,14 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 async fn generate(args: GenerateArgs) -> anyhow::Result<()> {
     require_device(args.model.device)?;
     let dtype = resolve_dtype(args.model.device, args.model.dtype)?;
-    let (model, codec, _) = load_pair(&args.model)?;
-    let model = into_engine_model(
-        model,
-        args.model.device.exec(),
+    let PreparedModels {
+        target: model,
+        draft,
+        codec,
+        name: _,
+    } = prepare_models(
+        &args.model,
+        &args.spec,
         dtype,
         args.num_blocks,
         args.block_size,
@@ -339,6 +374,7 @@ async fn generate(args: GenerateArgs) -> anyhow::Result<()> {
     sampling.validate()?;
     let (engine, _thread) = spawn(
         model,
+        draft,
         Arc::clone(&codec),
         args.num_blocks,
         args.block_size,
@@ -356,16 +392,19 @@ async fn generate(args: GenerateArgs) -> anyhow::Result<()> {
     let mut text = String::new();
     let mut completion_tokens = 0_usize;
     let mut reason = FinishReason::Length;
+    let mut spec_stats = None;
     while let Some(event) = submission.events.recv().await {
         match event {
             EngineEvent::Delta(delta) => text.push_str(&delta),
             EngineEvent::Done {
                 reason: done_reason,
                 completion_tokens: n,
+                spec,
                 ..
             } => {
                 completion_tokens = n;
                 reason = done_reason;
+                spec_stats = spec;
                 break;
             }
             EngineEvent::Error(message) => anyhow::bail!(message),
@@ -378,24 +417,115 @@ async fn generate(args: GenerateArgs) -> anyhow::Result<()> {
         0.0
     };
     if args.json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "text": text,
-                "completion_tokens": completion_tokens,
-                "finish_reason": reason.as_str(),
-                "seconds": elapsed,
-                "tokens_per_second": tok_s,
-            })
-        );
+        let mut payload = serde_json::json!({
+            "text": text,
+            "completion_tokens": completion_tokens,
+            "finish_reason": reason.as_str(),
+            "seconds": elapsed,
+            "tokens_per_second": tok_s,
+        });
+        if let Some(stats) = spec_stats {
+            payload["speculative"] = serde_json::json!({
+                "drafted_tokens": stats.drafted_tokens,
+                "accepted_tokens": stats.accepted_tokens,
+                "steps": stats.steps,
+                "acceptance_rate": stats.acceptance_rate(),
+                "mean_accepted_per_step": stats.mean_accepted_per_step(),
+            });
+        }
+        println!("{payload}");
     } else {
         println!("{text}");
         eprintln!(
             "finish={reason} tokens={completion_tokens} time={elapsed:.3}s tok/s={tok_s:.2}",
             reason = reason.as_str()
         );
+        if let Some(stats) = spec_stats {
+            eprintln!(
+                "spec_accept={accept:.3} mean_accepted={mean:.2} drafted={drafted} accepted={accepted} steps={steps}",
+                accept = stats.acceptance_rate(),
+                mean = stats.mean_accepted_per_step(),
+                drafted = stats.drafted_tokens,
+                accepted = stats.accepted_tokens,
+                steps = stats.steps,
+            );
+        }
     }
     Ok(())
+}
+
+struct PreparedModels {
+    target: Box<dyn LanguageModel>,
+    draft: Option<DraftSpec>,
+    codec: Arc<dyn TextCodec>,
+    name: String,
+}
+
+fn prepare_models(
+    args: &ModelArgs,
+    spec: &SpecArgs,
+    dtype: ExecDType,
+    num_blocks: usize,
+    block_size: usize,
+) -> anyhow::Result<PreparedModels> {
+    if args.dummy && spec.draft_model.is_some() {
+        anyhow::bail!("--draft-model cannot be combined with --dummy");
+    }
+    if spec.draft_model.is_some() && spec.speculative_tokens < 1 {
+        anyhow::bail!("--speculative-tokens must be at least 1");
+    }
+    let (model, codec, name) = load_pair(args)?;
+    let draft = load_draft_model(args, spec, &model)?;
+    let device = args.device.exec();
+    let target = into_engine_model(model, device, dtype, num_blocks, block_size)?;
+    let draft = match draft {
+        Some(draft) => {
+            tracing::info!(
+                draft = spec.draft_model.as_deref().unwrap_or(""),
+                quant = ?resolve_draft_quant(args.quant, spec.draft_quant),
+                k = spec.speculative_tokens,
+                "loading draft model"
+            );
+            Some(DraftSpec {
+                model: into_engine_model(draft, device, dtype, num_blocks, block_size)?,
+                k: spec.speculative_tokens,
+            })
+        }
+        None => None,
+    };
+    Ok(PreparedModels {
+        target,
+        draft,
+        codec,
+        name,
+    })
+}
+
+fn load_draft_model(
+    args: &ModelArgs,
+    spec: &SpecArgs,
+    target: &Model,
+) -> anyhow::Result<Option<Model>> {
+    let Some(source) = spec.draft_model.as_deref() else {
+        return Ok(None);
+    };
+    let draft_dir = resolve_model_source(source)?;
+    let quant = resolve_draft_quant(args.quant, spec.draft_quant);
+    let draft = Model::load_with(&draft_dir, quant.mode())?;
+    ensure_draft_compatible(target, &draft)?;
+    let target_dir = resolve_dir(args)?;
+    let target_tokenizer = FlintTokenizer::open(&target_dir)?;
+    let draft_tokenizer = FlintTokenizer::open(&draft_dir)?;
+    target_tokenizer.ensure_compatible(&draft_tokenizer)?;
+    Ok(Some(draft))
+}
+
+fn resolve_model_source(source: &str) -> anyhow::Result<PathBuf> {
+    let path = PathBuf::from(source);
+    if path.join("config.json").is_file() {
+        return Ok(path);
+    }
+    download_model(source)
 }
 
 fn logits(args: LogitsArgs) -> anyhow::Result<()> {

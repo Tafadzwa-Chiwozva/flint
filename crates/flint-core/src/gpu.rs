@@ -430,9 +430,64 @@ impl GpuModel {
             return Ok(Vec::new());
         }
         let mut meta = std::mem::take(&mut self.meta);
-        let built = self.build_plan(reqs, &mut meta);
+        let built = self.build_plan(reqs, &mut meta, false);
         let result = match built {
             Ok(plan) => self.execute(&plan),
+            Err(err) => Err(err),
+        };
+        self.meta = meta;
+        result
+    }
+
+    /// Logits for every token in one chunk, or only the last token.
+    ///
+    /// A single token uses the decode path, including a captured CUDA graph
+    /// when the batch shape is one of the recorded widths. A longer chunk is
+    /// the speculative verification forward: one prefill launch scores every
+    /// position and does not replay a decode graph.
+    pub fn forward_token_logits(
+        &mut self,
+        tokens: &[u32],
+        position: usize,
+        block_table: &[u32],
+        all_positions: bool,
+    ) -> Result<Vec<Vec<f32>>, Error> {
+        if tokens.is_empty() {
+            return Err(Error::Inference("forward chunk is empty".into()));
+        }
+        if !all_positions || tokens.len() == 1 {
+            let req = [ForwardChunk {
+                tokens,
+                position,
+                block_table,
+                want_logits: true,
+            }];
+            let mut rows = self.forward_batch(&req)?;
+            let logits = rows
+                .pop()
+                .flatten()
+                .ok_or_else(|| Error::Inference("GPU forward did not return logits".into()))?;
+            return Ok(vec![logits]);
+        }
+        let mut meta = std::mem::take(&mut self.meta);
+        let req = [ForwardChunk {
+            tokens,
+            position,
+            block_table,
+            want_logits: true,
+        }];
+        let built = self.build_plan(&req, &mut meta, true);
+        let result = match built {
+            Ok(plan) => {
+                let n = plan.logit_count;
+                if n != tokens.len() {
+                    Err(Error::Inference(
+                        "GPU verification forward did not score every token".into(),
+                    ))
+                } else {
+                    self.launch(&plan).and_then(|_| self.read_row_logits(n))
+                }
+            }
             Err(err) => Err(err),
         };
         self.meta = meta;
@@ -443,6 +498,7 @@ impl GpuModel {
         &self,
         reqs: &[ForwardChunk<'_>],
         meta: &'a mut Meta,
+        per_token_logits: bool,
     ) -> Result<BatchPlan<'a>, Error> {
         let mut tokens = Vec::new();
         let mut positions = Vec::new();
@@ -505,7 +561,11 @@ impl GpuModel {
                 decode_lens.push(decode_len);
                 max_decode_len = max_decode_len.max(decode_len);
             }
-            if req.want_logits {
+            if per_token_logits {
+                for offset in 0..len {
+                    logit_rows.push(as_i32(row0 + offset, "logit row")?);
+                }
+            } else if req.want_logits {
                 logit_rows.push(as_i32(row0 + len - 1, "logit row")?);
             }
             seqs.push(SeqPlan {
@@ -814,6 +874,11 @@ impl GpuModel {
     }
 
     fn execute(&mut self, plan: &BatchPlan<'_>) -> Result<Vec<Option<Vec<f32>>>, Error> {
+        self.launch(plan)?;
+        self.read_logits(plan)
+    }
+
+    fn launch(&mut self, plan: &BatchPlan<'_>) -> Result<(), Error> {
         let logit_n = plan.logit_count;
         let scratch_grew = plan.rows > self.scratch_rows;
         let logit_grew = logit_n > self.logit_slots;
@@ -835,11 +900,10 @@ impl GpuModel {
                 self.dev
                     .launch_graph(self.graphs.get(&key).expect("graph key present"))
                     .map_err(gpu_err)?;
-                return self.read_logits(plan);
+                return Ok(());
             }
         }
         self.run_forward(plan)?;
-        let logits = self.read_logits(plan)?;
         if let Some(key) = key {
             if self.graphs_ok {
                 match self.capture(plan) {
@@ -854,7 +918,19 @@ impl GpuModel {
                 }
             }
         }
-        Ok(logits)
+        Ok(())
+    }
+
+    fn read_row_logits(&self, n: usize) -> Result<Vec<Vec<f32>>, Error> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let vocab = self.cfg.vocab_size;
+        let host = self
+            .dev
+            .download_f32(&self.scratch.logits, n * vocab)
+            .map_err(gpu_err)?;
+        Ok(host.chunks(vocab).map(|row| row.to_vec()).collect())
     }
 
     fn graph_key(&self, plan: &BatchPlan<'_>) -> Option<(usize, i32)> {

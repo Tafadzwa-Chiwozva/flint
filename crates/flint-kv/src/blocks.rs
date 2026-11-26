@@ -159,6 +159,23 @@ impl BlockSpaceManager {
         Ok(())
     }
 
+    /// Shrink `table` so it addresses `num_tokens` and return the freed ids.
+    ///
+    /// Speculative decoding reserves blocks for draft tokens, then drops the
+    /// tail after rejection. Blocks that still hold the kept prefix stay.
+    /// `num_tokens == 0` frees the whole table. The free list receives every
+    /// id that was split off.
+    pub fn truncate(&mut self, table: &mut Vec<u32>, num_tokens: usize) -> Result<usize, KvError> {
+        let keep = self.blocks_for_tokens(num_tokens);
+        if table.len() <= keep {
+            return Ok(0);
+        }
+        let extra = table.split_off(keep);
+        let freed = extra.len();
+        self.free_ids(&extra)?;
+        Ok(freed)
+    }
+
     /// Share an existing table. Each id's refcount increases by one.
     ///
     /// The returned table is the prefix-cache hit: the new sequence reads the
@@ -243,6 +260,27 @@ mod tests {
         assert_eq!(err, KvError::OutOfBlocks { need: 2, free: 1 });
         assert_eq!(table.len(), 1);
         assert_eq!(mgr.free_count(), 1);
+    }
+
+    #[test]
+    fn truncate_returns_lookahead_blocks_to_the_free_list() {
+        let mut mgr = BlockSpaceManager::new(8, 2).unwrap();
+        let mut table = Vec::new();
+        mgr.reserve(&mut table, 4).unwrap();
+        assert_eq!(table.len(), 2);
+        assert_eq!(mgr.free_count(), 6);
+        // Draft tokens spill into new blocks, including a partial last block.
+        mgr.reserve(&mut table, 4 + 5).unwrap();
+        assert_eq!(table.len(), 5);
+        assert_eq!(mgr.free_count(), 3);
+        let freed = mgr.truncate(&mut table, 5).unwrap();
+        assert_eq!(freed, 2);
+        assert_eq!(table.len(), 3);
+        assert_eq!(mgr.free_count() + table.len(), mgr.total_blocks());
+        mgr.truncate(&mut table, 0).unwrap();
+        assert!(table.is_empty());
+        assert_eq!(mgr.free_count(), 8);
+        assert_eq!(mgr.truncate(&mut table, 0).unwrap(), 0);
     }
 
     #[test]

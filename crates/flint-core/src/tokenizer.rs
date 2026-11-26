@@ -109,6 +109,59 @@ impl FlintTokenizer {
     pub fn eos_ids(&self) -> &[u32] {
         &self.eos_ids
     }
+
+    /// Reject a draft tokenizer whose token-to-id map differs from this one.
+    ///
+    /// Speculative decoding is only lossless when a token id means the same
+    /// piece of text in both models. Vocab size alone is not enough: a shared
+    /// size with a permuted encoding would accept the wrong string.
+    pub fn ensure_compatible(&self, draft: &FlintTokenizer) -> Result<(), Error> {
+        check_vocab_maps(&self.inner.get_vocab(true), &draft.inner.get_vocab(true))
+    }
+}
+
+/// Compare two token-to-id maps. The error names one mismatched token.
+pub(crate) fn check_vocab_maps(
+    target: &std::collections::HashMap<String, u32>,
+    draft: &std::collections::HashMap<String, u32>,
+) -> Result<(), Error> {
+    if target.len() != draft.len() {
+        return Err(Error::Tokenizer(format!(
+            "draft tokenizer is not compatible with the target tokenizer: vocab size {} vs {}",
+            draft.len(),
+            target.len()
+        )));
+    }
+    let mut mismatch = 0_usize;
+    let mut example = None;
+    for (token, id) in target {
+        match draft.get(token) {
+            Some(other) if other == id => {}
+            Some(other) => {
+                mismatch += 1;
+                if example.is_none() {
+                    example = Some(format!(
+                        "token {token:?} is id {id} in the target and {other} in the draft"
+                    ));
+                }
+            }
+            None => {
+                mismatch += 1;
+                if example.is_none() {
+                    example = Some(format!(
+                        "token {token:?} is missing from the draft tokenizer"
+                    ));
+                }
+            }
+        }
+    }
+    if mismatch > 0 {
+        return Err(Error::Tokenizer(format!(
+            "draft tokenizer is not compatible with the target tokenizer ({mismatch} vocab differences; {})",
+            example.unwrap_or_default()
+        )));
+    }
+    Ok(())
 }
 
 fn read_eos_ids(path: &Path) -> Vec<u32> {
@@ -165,6 +218,23 @@ mod tests {
             text,
             "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
         );
+    }
+
+    #[test]
+    fn vocab_maps_reject_a_permuted_or_missing_token() {
+        let mut target = std::collections::HashMap::new();
+        target.insert("a".into(), 1_u32);
+        target.insert("b".into(), 2);
+        let mut same = target.clone();
+        check_vocab_maps(&target, &same).unwrap();
+        same.insert("b".into(), 9);
+        let err = check_vocab_maps(&target, &same).unwrap_err();
+        assert!(err.to_string().contains("not compatible"));
+        same.insert("b".into(), 2);
+        same.remove("a");
+        same.insert("c".into(), 1);
+        let err = check_vocab_maps(&target, &same).unwrap_err();
+        assert!(err.to_string().contains("not compatible"));
     }
 
     #[test]

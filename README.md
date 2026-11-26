@@ -200,7 +200,7 @@ Inter-token latency is the gap between SSE events that carry text. At concurrenc
 - Block refcounts and copy-on-write are ready for prefix sharing. The scheduler does not use them yet.
 - The CPU path widens weights to f32 unless `--quant int8` is set. There is no 4-bit matmul. CUDA can keep activations in bf16 (see Phase 2) and linear weights in INT8 (see Phase 3).
 - `--device cuda` (see Phase 2) is off unless the binary is built with `--features cuda`. The default build and the default CI job stay CPU-only.
-- No speculative decoding, no repetition penalty, no tool calls. `n` other than 1 is rejected; concurrency is multiple HTTP requests.
+- No repetition penalty and no tool calls. Speculative decoding is optional (`--draft-model`, see Phase 3). `n` other than 1 is rejected; concurrency is multiple HTTP requests.
 - Detokenization decodes the full generated prefix each step. Stop-string filtering then decides how much of the new suffix is safe to emit.
 
 ## Phase 2 — CUDA forward path
@@ -247,7 +247,7 @@ cargo build --release -p flint-server --features cuda
   --max-num-seqs 32 --num-blocks 512
 ```
 
-What this chunk does not do: flash-attention tuning, 4-bit weights, speculative decoding, and scheduler prefix caching. The host `PagedKvCache` is still allocated beside the device cache; the GPU model does not read it. Prefill attention is a correct causal walk over the block table, not a fused flash kernel.
+What this chunk does not do: flash-attention tuning, 4-bit weights, and scheduler prefix caching. The host `PagedKvCache` is still allocated beside the device cache; the GPU model does not read it. Prefill attention is a correct causal walk over the block table, not a fused flash kernel. Speculative decoding is a separate draft model (see Phase 3), not a change to this kernel path.
 
 ## Phase 3 — INT8 weight-only quantization
 
@@ -261,11 +261,27 @@ cargo run --release -p flint-server --features cuda -- serve \
   --device cuda --dtype bf16 --quant int8 --model-dir models/Qwen2.5-0.5B-Instruct
 ```
 
+## Speculative decoding
+
+`--draft-model` turns on lossless draft-model speculative decoding for `flint serve` and `flint generate`. Leave it unset and the engine is the ordinary one-token loop, including CUDA-graph decode. The draft is a local directory that contains `config.json`, or a Hugging Face repo id. `--draft-quant` is `none` or `int8`; when it is omitted, an INT8 target keeps an INT8 draft and every other target uses INT8 for the draft. `--speculative-tokens` is the proposal width `K` (default 4). The draft and the target must share a vocabulary width and the same tokenizer map. A mismatch is an error at startup and the message says the vocabularies are not compatible. `--dummy` cannot be combined with a draft model. The draft uses the same device and dtype as the target.
+
+Each step the draft writes `K` candidates into its own paged cache. The target scores them in one multi-token forward and produces `K + 1` logit vectors. Greedy decoding (`temperature` 0) keeps the longest prefix whose argmax equals the draft token, then emits the target argmax at the first mismatch, or the bonus argmax when all `K` match. That sequence is the same one ordinary greedy decoding would have produced. Stochastic decoding uses Leviathan / Chen rejection sampling: accept with probability `min(1, p/q)`, and on the first rejection draw from `normalize(max(0, p - q))`. A full accept draws the bonus token from the target distribution. Both caches are then truncated to the committed prefix. The recovered token stays pending, and the freed blocks go back on the free list.
+
+A scheduler step with one sequence uses that loop. A step with several sequences keeps the existing batched forward, so continuous batching and CUDA graphs stay in place, and the draft cache is advanced with one batched forward of the same tokens. If the lookahead blocks do not fit, that step decodes a single token instead of failing the request. `flint generate --json` adds a `speculative` object (`drafted_tokens`, `accepted_tokens`, `steps`, `acceptance_rate`, `mean_accepted_per_step`). The server logs the same counters as `speculative stats` when a request finishes. The OpenAI HTTP payload is unchanged.
+
+```bash
+cargo run --release -p flint-server --features cuda -- serve \
+  --device cuda --dtype bf16 --quant none \
+  --model-dir models/Qwen--Qwen2.5-3B-Instruct \
+  --draft-model models/Qwen--Qwen2.5-0.5B-Instruct --draft-quant int8 \
+  --speculative-tokens 4
+```
+
 ## Roadmap
 
 **Phase 2 — rest of GPU execution.** Flash-style attention for long prefills, scheduler prefix sharing on the device cache, and dropping the unused host KV allocation. The CPU path stays the oracle.
 
-**Phase 3 — the comparison that the project is for.** Weight-only INT8 is in (`--quant int8` on CPU and CUDA). Still open: 4-bit weights, speculative decoding with a small draft model, and `flint-bench` against vLLM and llama.cpp server on RTX 4090, A100, and H100. Report tokens per second, time to first token, and cost per million tokens from the same JSON the harness already writes.
+**Phase 3 — the comparison that the project is for.** Weight-only INT8 is in (`--quant int8` on CPU and CUDA). Lossless draft-model speculative decoding is in (`--draft-model` on CPU and CUDA). Still open: 4-bit weights, and `flint-bench` against vLLM and llama.cpp server on RTX 4090, A100, and H100. Report tokens per second, time to first token, and cost per million tokens from the same JSON the harness already writes.
 
 ## Development
 

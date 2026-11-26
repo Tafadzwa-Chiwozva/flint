@@ -94,6 +94,14 @@ pub enum ScheduleError {
     /// SchedulerConfig or block pool was unusable.
     #[error("{0}")]
     Config(&'static str),
+    /// Lookahead could not reserve blocks. The sequence's table is unchanged.
+    #[error("out of KV blocks (need {need}, free {free})")]
+    OutOfBlocks {
+        /// Additional blocks that were requested.
+        need: usize,
+        /// Blocks on the free list.
+        free: usize,
+    },
 }
 
 /// One sequence's work for this iteration.
@@ -244,6 +252,52 @@ impl Scheduler {
     #[must_use]
     pub fn block_table_len(&self, id: u64) -> Option<usize> {
         self.sequences.get(&id).map(|seq| seq.block_table.len())
+    }
+
+    /// Block ids for `id`, if the sequence is still known.
+    #[must_use]
+    pub fn block_table(&self, id: u64) -> Option<&[u32]> {
+        self.sequences
+            .get(&id)
+            .map(|seq| seq.block_table.as_slice())
+    }
+
+    /// Grow the block table so `num_tokens` positions are addressable.
+    ///
+    /// The token list is unchanged. Speculative verification uses this to
+    /// cover draft tokens that are not committed yet. On failure the table is
+    /// left as it was.
+    pub fn ensure_blocks(&mut self, id: u64, num_tokens: usize) -> Result<(), ScheduleError> {
+        if !self.sequences.contains_key(&id) {
+            return Err(ScheduleError::Unknown(id));
+        }
+        let mut table = std::mem::take(&mut self.sequences.get_mut(&id).unwrap().block_table);
+        let result = self.blocks.reserve(&mut table, num_tokens);
+        self.sequences.get_mut(&id).unwrap().block_table = table;
+        match result {
+            Ok(()) => Ok(()),
+            Err(flint_kv::KvError::OutOfBlocks { need, free }) => {
+                Err(ScheduleError::OutOfBlocks { need, free })
+            }
+            Err(_) => Err(ScheduleError::Config("block reserve failed")),
+        }
+    }
+
+    /// Free blocks the sequence no longer needs once `num_tokens` is the length
+    /// that must stay addressable (including a not-yet-computed pending token).
+    ///
+    /// Returns how many blocks went back to the free list.
+    pub fn truncate_blocks(&mut self, id: u64, num_tokens: usize) -> Result<usize, ScheduleError> {
+        if !self.sequences.contains_key(&id) {
+            return Err(ScheduleError::Unknown(id));
+        }
+        let mut table = std::mem::take(&mut self.sequences.get_mut(&id).unwrap().block_table);
+        let freed = self
+            .blocks
+            .truncate(&mut table, num_tokens)
+            .expect("block table ids are live");
+        self.sequences.get_mut(&id).unwrap().block_table = table;
+        Ok(freed)
     }
 
     /// Queue a prompt. Admission happens later, inside [`Self::schedule`].
@@ -732,5 +786,22 @@ mod tests {
             .items
             .iter()
             .all(|item| item.request_id != 3 && item.tokens.len() == 1 && item.sample_after));
+    }
+
+    #[test]
+    fn lookahead_blocks_come_back_on_truncate() {
+        let mut sched = scheduler(8, 2, 8, 32, 2);
+        sched.add_request(1, prompt(4), 4).unwrap();
+        let step = sched.schedule();
+        assert_eq!(sched.block_table_len(1), Some(2));
+        sched.ensure_blocks(1, 4 + 6).unwrap();
+        assert_eq!(sched.block_table_len(1), Some(5));
+        let freed = sched.truncate_blocks(1, 5).unwrap();
+        assert_eq!(freed, 2);
+        assert_eq!(sched.block_table_len(1), Some(3));
+        assert_eq!(sched.free_blocks() + sched.block_table_len(1).unwrap(), 8);
+        // The reserved tail was not committed, so the token list is unchanged.
+        assert_eq!(sched.token_len(1), Some(4));
+        let _ = step;
     }
 }

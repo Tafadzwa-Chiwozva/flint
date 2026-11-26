@@ -10,6 +10,14 @@
 # The summary says whether each mode kept CUDA graphs enabled, and the script
 # exits non-zero if either mode disables them.
 #
+# Speculative decoding is on by default (`FLINT_RUN_SPEC=0` skips it). It
+# serves the bf16 target with the already-downloaded 0.5B checkpoint as an
+# INT8 draft, runs `flint generate --json` for acceptance, and benches
+# concurrency 1. Set `FLINT_SPEC_TARGET` (for example
+# `Qwen/Qwen2.5-3B-Instruct`) to download a larger target and draft it with
+# the 0.5B INT8 model. The spec log is `/tmp/flint-gpu-serve-spec.log`. A
+# spec failure does not rewrite the bf16 or int8 graph status.
+#
 # Usage (on the GPU machine, from anywhere):
 #   bash scripts/gpu_smoke.sh
 # Optional:
@@ -25,6 +33,8 @@ KERNEL_STATUS="not run"
 CORE_STATUS="not run"
 GRAPH_BF16="not run"
 GRAPH_INT8="not run"
+GRAPH_SPEC="not run"
+SPEC_STATUS="skipped"
 BENCH_ROWS=()
 
 serve_log() {
@@ -56,6 +66,8 @@ summary() {
   printf "%-12s %s\n" "core" "${CORE_STATUS}"
   printf "%-12s %s\n" "graphs bf16" "${GRAPH_BF16}"
   printf "%-12s %s\n" "graphs int8" "${GRAPH_INT8}"
+  printf "%-12s %s\n" "graphs spec" "${GRAPH_SPEC}"
+  printf "%-12s %s\n" "speculative" "${SPEC_STATUS}"
   if [[ "${GRAPH_BF16}" == "DISABLED" ]]; then
     echo "bf16 CUDA graph capture failed ($(serve_log bf16)):"
     grep "disabling CUDA graphs" "$(serve_log bf16)" || true
@@ -74,8 +86,8 @@ summary() {
       printf "%-8s %-6s %12s %12s %12s %12s\n" ${row}
     done
   fi
-  echo "bench JSON: bench-results/gpu-{bf16,int8}-c{1,8,32}.json"
-  echo "server logs: $(serve_log bf16) $(serve_log int8)"
+  echo "bench JSON: bench-results/gpu-{bf16,int8}-c{1,8,32}.json bench-results/gpu-spec-c1.json"
+  echo "server logs: $(serve_log bf16) $(serve_log int8) $(serve_log spec)"
   echo "==============================================="
 }
 trap summary EXIT
@@ -282,6 +294,115 @@ bench_mode bf16 none
 bench_mode int8 int8
 refresh_graphs
 
-if [[ "${KERNEL_STATUS}" != "PASS" || "${CORE_STATUS}" != "PASS" || "${GRAPH_BF16}" == "DISABLED" || "${GRAPH_INT8}" == "DISABLED" ]]; then
+RUN_SPEC="${FLINT_RUN_SPEC:-1}"
+if [[ "${RUN_SPEC}" != "0" ]]; then
+  SPEC_TARGET_DIR="${FLINT_MODEL_DIR}"
+  SPEC_MODEL_ID="${MODEL_ID}"
+  if [[ -n "${FLINT_SPEC_TARGET:-}" ]]; then
+    SPEC_MODEL_ID="${FLINT_SPEC_TARGET}"
+    SPEC_TARGET_DIR="${PWD}/models/${SPEC_MODEL_ID//\//--}"
+    mkdir -p "${SPEC_TARGET_DIR}"
+    SPEC_BASE="https://huggingface.co/${SPEC_MODEL_ID}/resolve/main"
+    echo "== speculative target ${SPEC_MODEL_ID} =="
+    for name in config.json tokenizer.json model.safetensors tokenizer_config.json generation_config.json; do
+      if [[ -s "${SPEC_TARGET_DIR}/${name}" ]]; then
+        continue
+      fi
+      if ! curl -fL --retry 3 --retry-delay 2 -o "${SPEC_TARGET_DIR}/${name}" "${SPEC_BASE}/${name}"; then
+        rm -f "${SPEC_TARGET_DIR}/${name}"
+        if [[ "${name}" == "config.json" || "${name}" == "tokenizer.json" || "${name}" == "model.safetensors" ]]; then
+          echo "failed to download ${name} for ${SPEC_MODEL_ID}" >&2
+          SPEC_STATUS="FAIL"
+        fi
+      fi
+    done
+  fi
+  if [[ "${SPEC_STATUS}" != "FAIL" ]]; then
+    SPEC_LOG="$(serve_log spec)"
+    cleanup
+    echo "== serve spec (bf16 target, int8 draft) log ${SPEC_LOG} =="
+    ./target/release/flint serve \
+      --device cuda \
+      --dtype bf16 \
+      --quant none \
+      --draft-model "${FLINT_MODEL_DIR}" \
+      --draft-quant int8 \
+      --speculative-tokens 4 \
+      --host 127.0.0.1 \
+      --port "${PORT}" \
+      --model-dir "${SPEC_TARGET_DIR}" \
+      --max-num-seqs 32 \
+      --max-batched-tokens 4096 \
+      --num-blocks 512 \
+      >"${SPEC_LOG}" 2>&1 &
+    SERVER_PID=$!
+    SPEC_STATUS="FAIL"
+    wait_healthy "${PORT}" "${SPEC_LOG}"
+    echo "== speculative generate =="
+      if ./target/release/flint generate \
+        --device cuda \
+        --dtype bf16 \
+        --quant none \
+        --model-dir "${SPEC_TARGET_DIR}" \
+        --draft-model "${FLINT_MODEL_DIR}" \
+        --draft-quant int8 \
+        --speculative-tokens 4 \
+        --prompt "Hello, my name is" \
+        --max-tokens 32 \
+        --json > bench-results/gpu-spec-generate.json; then
+        python3 - <<'PY'
+import json
+doc = json.load(open("bench-results/gpu-spec-generate.json"))
+spec = doc.get("speculative") or {}
+print(
+    "speculative generate: "
+    f"acceptance={spec.get('acceptance_rate')} "
+    f"mean_accepted={spec.get('mean_accepted_per_step')} "
+    f"drafted={spec.get('drafted_tokens')} "
+    f"steps={spec.get('steps')}"
+)
+if not spec or spec.get("drafted_tokens", 0) <= 0:
+    raise SystemExit("generate JSON did not report drafted tokens")
+PY
+        echo "== bench spec concurrency 1 =="
+        ./target/release/flint-bench \
+          --url "http://127.0.0.1:${PORT}" \
+          --model "${SPEC_MODEL_ID}" \
+          --endpoint completions \
+          --concurrency 1 \
+          --requests 4 \
+          --warmup 1 \
+          --max-tokens 32 \
+          --temperature 0 \
+          --quant none \
+          --prompt "Hello, my name is" \
+          --prompt "The capital of France is" \
+          --json-out "bench-results/gpu-spec-c1.json"
+        row="$(python3 - <<'PY'
+import json
+report = json.load(open("bench-results/gpu-spec-c1.json"))
+ttft = report["ttft_ms"]
+itl = report.get("itl_ms") or {}
+itl_p50 = itl.get("p50")
+itl_s = "-" if itl_p50 is None else f"{itl_p50:.1f}"
+print(f"{report['throughput_tok_s']:.2f} {ttft['p50']:.1f} {ttft['p99']:.1f} {itl_s}")
+PY
+)"
+        BENCH_ROWS+=("spec 1 ${row}")
+        SPEC_STATUS="PASS"
+      else
+        SPEC_STATUS="FAIL"
+      fi
+    cleanup
+    GRAPH_SPEC="$(graph_status spec)"
+    if [[ "${GRAPH_SPEC}" == "DISABLED" ]]; then
+      echo "speculative serve disabled CUDA graphs ($(serve_log spec)):" >&2
+      grep "disabling CUDA graphs" "$(serve_log spec)" || true
+      SPEC_STATUS="FAIL"
+    fi
+  fi
+fi
+
+if [[ "${KERNEL_STATUS}" != "PASS" || "${CORE_STATUS}" != "PASS" || "${GRAPH_BF16}" == "DISABLED" || "${GRAPH_INT8}" == "DISABLED" || "${SPEC_STATUS}" == "FAIL" ]]; then
   exit 1
 fi

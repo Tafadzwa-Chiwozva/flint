@@ -81,6 +81,100 @@ impl SamplingParams {
 /// Non-finite logits are an error: a NaN in the forward pass should fail the
 /// request instead of silently emitting token 0.
 pub fn sample(logits: &[f32], params: &SamplingParams, rng: &mut impl Rng) -> Result<u32, Error> {
+    params.validate()?;
+    if params.temperature == 0.0 {
+        return Ok(checked_argmax(logits)? as u32);
+    }
+    let scored = candidates(logits, params)?;
+    Ok(categorical(&scored, rng)? as u32)
+}
+
+/// Probability of every token under [`sample`].
+///
+/// Temperature, top-k, and top-p match [`sample`]. Tokens the filters remove
+/// are `0`. Temperature `0` is a one-hot vector at the greedy argmax. The
+/// remaining mass sums to 1. Speculative rejection sampling uses this as
+/// `p` and `q`.
+pub fn sampling_distribution(logits: &[f32], params: &SamplingParams) -> Result<Vec<f32>, Error> {
+    params.validate()?;
+    let mut probs = vec![0.0; logits.len()];
+    if params.temperature == 0.0 {
+        let index = checked_argmax(logits)?;
+        probs[index] = 1.0;
+        return Ok(probs);
+    }
+    let scored = candidates(logits, params)?;
+    let max = scored
+        .iter()
+        .map(|item| item.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut weights = Vec::with_capacity(scored.len());
+    let mut sum = 0.0_f32;
+    for item in &scored {
+        let weight = (item.1 - max).exp();
+        weights.push(weight);
+        sum += weight;
+    }
+    if sum == 0.0 || !sum.is_finite() {
+        probs[scored[0].0] = 1.0;
+        return Ok(probs);
+    }
+    for (item, weight) in scored.iter().zip(weights) {
+        probs[item.0] = weight / sum;
+    }
+    Ok(probs)
+}
+
+/// Draw from a dense probability vector. Non-positive entries are skipped.
+pub fn sample_from_probs(probs: &[f32], rng: &mut impl Rng) -> Result<u32, Error> {
+    if probs.is_empty() || probs.iter().any(|prob| !prob.is_finite() || *prob < 0.0) {
+        return Err(Error::Sampling(
+            "probabilities must be finite and >= 0".into(),
+        ));
+    }
+    let sum: f32 = probs.iter().copied().filter(|prob| *prob > 0.0).sum();
+    if sum == 0.0 || !sum.is_finite() {
+        return Err(Error::Sampling("probability vector has no mass".into()));
+    }
+    let mut threshold = rng.gen::<f32>() * sum;
+    let mut last = 0_u32;
+    for (index, prob) in probs.iter().enumerate() {
+        if *prob <= 0.0 {
+            continue;
+        }
+        last = index as u32;
+        threshold -= prob;
+        if threshold <= 0.0 {
+            return Ok(last);
+        }
+    }
+    Ok(last)
+}
+
+/// Lowest-index argmax. Ties break toward zero, matching [`sample`] at temperature 0.
+pub(crate) fn argmax_index(logits: &[f32]) -> usize {
+    let mut best_index = 0;
+    let mut best = f32::NEG_INFINITY;
+    for (index, &logit) in logits.iter().enumerate() {
+        if logit > best {
+            best = logit;
+            best_index = index;
+        }
+    }
+    best_index
+}
+
+pub(crate) fn checked_argmax(logits: &[f32]) -> Result<usize, Error> {
+    if logits.is_empty() {
+        return Err(Error::Sampling("empty logits".into()));
+    }
+    if logits.iter().any(|logit| !logit.is_finite()) {
+        return Err(Error::Sampling("non-finite logit".into()));
+    }
+    Ok(argmax_index(logits))
+}
+
+fn candidates(logits: &[f32], params: &SamplingParams) -> Result<Vec<(usize, f32)>, Error> {
     if logits.is_empty() {
         return Err(Error::Sampling("empty logits".into()));
     }
@@ -88,10 +182,6 @@ pub fn sample(logits: &[f32], params: &SamplingParams, rng: &mut impl Rng) -> Re
         return Err(Error::Sampling("non-finite logit".into()));
     }
     params.validate()?;
-    if params.temperature == 0.0 {
-        return Ok(argmax(logits) as u32);
-    }
-
     let inv_temp = 1.0 / params.temperature;
     let mut scored: Vec<(usize, f32)> = logits
         .iter()
@@ -112,20 +202,12 @@ pub fn sample(logits: &[f32], params: &SamplingParams, rng: &mut impl Rng) -> Re
             scored = nucleus(scored, top_p);
         }
     }
-
-    Ok(categorical(&scored, rng)? as u32)
-}
-
-fn argmax(logits: &[f32]) -> usize {
-    let mut best_index = 0;
-    let mut best = f32::NEG_INFINITY;
-    for (index, &logit) in logits.iter().enumerate() {
-        if logit > best {
-            best = logit;
-            best_index = index;
-        }
+    if scored.is_empty() {
+        return Err(Error::Sampling(
+            "sampling filter removed every token".into(),
+        ));
     }
-    best_index
+    Ok(scored)
 }
 
 fn nucleus(mut scored: Vec<(usize, f32)>, top_p: f32) -> Vec<(usize, f32)> {
@@ -290,5 +372,30 @@ mod tests {
         assert!(params.validate().is_err());
         params.top_p = None;
         assert!(sample(&[0.0, f32::NAN], &params, &mut rng(1)).is_err());
+    }
+
+    #[test]
+    fn distribution_matches_the_filters_and_sums_to_one() {
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: Some(2),
+            top_p: None,
+            seed: None,
+        };
+        let probs = sampling_distribution(&[0.0, 1.0, 4.0, 3.0], &params).unwrap();
+        assert_eq!(probs[0], 0.0);
+        assert_eq!(probs[1], 0.0);
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "sum {sum}");
+        let mut hits = [0_u32; 4];
+        for seed in 0..200 {
+            let token = sample_from_probs(&probs, &mut rng(seed)).unwrap();
+            hits[token as usize] += 1;
+        }
+        assert_eq!(hits[0], 0);
+        assert_eq!(hits[1], 0);
+        assert!(hits[2] > 0 && hits[3] > 0);
+        let greedy = sampling_distribution(&[0.2, 0.2, 0.9], &SamplingParams::greedy()).unwrap();
+        assert_eq!(greedy, vec![0.0, 0.0, 1.0]);
     }
 }
