@@ -92,6 +92,36 @@ pub(crate) fn quantize_per_channel(
     (q, scales)
 }
 
+/// Split `out_features` into dequant spans that fit in `scratch_elems`.
+///
+/// `in_features` is the row width. A scratch that holds the whole matrix
+/// returns one span, so a prefill GEMM is one dequant plus one cuBLAS call.
+/// A smaller scratch returns several spans. An empty matrix, or a scratch
+/// that cannot hold one row, returns no spans; the caller reports that
+/// instead of writing past the buffer.
+#[cfg_attr(all(not(test), not(feature = "cuda")), allow(dead_code))]
+pub(crate) fn dequant_tiles(
+    out_features: usize,
+    in_features: usize,
+    scratch_elems: usize,
+) -> Vec<usize> {
+    if out_features == 0 || in_features == 0 {
+        return Vec::new();
+    }
+    let rows_fit = scratch_elems / in_features;
+    if rows_fit == 0 {
+        return Vec::new();
+    }
+    let mut tiles = Vec::new();
+    let mut done = 0;
+    while done < out_features {
+        let n = (out_features - done).min(rows_fit);
+        tiles.push(n);
+        done += n;
+    }
+    tiles
+}
+
 /// Expand per-channel INT8 back to f32. `q` is row-major `[scales.len(), cols]`.
 ///
 /// The forward path dequantizes one row or one product at a time. This copy is
@@ -217,5 +247,20 @@ mod tests {
         linear_i8(&q, &scales, None, &x, &mut y_plain, rows, out, k);
         assert!((y_i8[0] - (y_plain[0] + 0.25)).abs() < 1e-5);
         assert!((y_i8[1] - (y_plain[1] - 0.5)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn dequant_tiles_cover_the_matrix_in_one_span_when_scratch_fits() {
+        // Qwen2.5-0.5B LM head. A 2048-channel scratch is 75 launches; the
+        // full matrix is one.
+        let vocab = 151_936;
+        let hidden = 896;
+        assert_eq!(dequant_tiles(vocab, hidden, vocab * hidden), vec![vocab]);
+        let tiled = dequant_tiles(vocab, hidden, 2048 * hidden);
+        assert_eq!(tiled.len(), 75);
+        assert_eq!(tiled.iter().sum::<usize>(), vocab);
+        assert!(tiled.iter().all(|n| *n <= 2048));
+        assert!(dequant_tiles(vocab, hidden, hidden - 1).is_empty());
+        assert!(dequant_tiles(0, hidden, hidden).is_empty());
     }
 }

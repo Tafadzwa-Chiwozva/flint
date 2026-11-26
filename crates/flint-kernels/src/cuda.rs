@@ -3,15 +3,17 @@
 //! Kernels are the PTX image `build.rs` produces from `kernels/ops.cu`. This
 //! module loads that image with the CUDA driver API (via `cudarc`) and runs
 //! GEMMs through cuBLAS in full f32 (`CUBLAS_PEDANTIC_MATH`, so tensor-core
-//! TF32 does not change the result). Nothing here runs unless a caller
-//! constructs a [`Device`], which needs a live NVIDIA driver.
+//! TF32 does not change the result). All of that work is submitted to one
+//! non-blocking stream. The legacy default stream cannot be captured, and it
+//! implicitly synchronizes every cuBLAS launch. Nothing here runs unless a
+//! caller constructs a [`Device`], which needs a live NVIDIA driver.
 
 use std::ffi::{c_int, c_void};
 use std::sync::Arc;
 
 use cudarc::cublas::sys::{
     cublasComputeType_t, cublasGemmAlgo_t, cublasMath_t, cublasOperation_t, cublasSetMathMode,
-    cublasStatus_t, cudaDataType_t,
+    cublasSetWorkspace_v2, cublasStatus_t, cudaDataType_t,
 };
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::sys::CUgraphInstantiate_flags;
@@ -23,6 +25,10 @@ use cudarc::driver::{
 use cudarc::nvrtc::Ptx;
 
 const FLINT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/flint.ptx"));
+
+/// Bytes reserved for cuBLAS so a captured GEMM does not call `cudaMalloc`.
+/// 32 MiB is the size cuBLAS documents for Ada and Hopper.
+const CUBLAS_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Largest head dimension the attention kernel keeps in registers.
 pub const MAX_HEAD_DIM: usize = 256;
@@ -93,6 +99,12 @@ impl F32Buf {
         Self { data: None, cap: 0 }
     }
 
+    /// Elements allocated, which may exceed the prefix a kernel uses.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
     fn view(&self, n: usize) -> Result<CudaView<'_, f32>, CudaError> {
         let data = self
             .data
@@ -129,6 +141,12 @@ impl Bf16Buf {
     #[must_use]
     pub fn empty() -> Self {
         Self { data: None, cap: 0 }
+    }
+
+    /// Elements allocated, which may exceed the prefix a kernel uses.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.cap
     }
 
     fn view(&self, n: usize) -> Result<CudaView<'_, u16>, CudaError> {
@@ -248,6 +266,9 @@ pub struct AttnShape {
 pub struct Device {
     stream: Arc<CudaStream>,
     blas: CudaBlas,
+    /// User workspace for the cuBLAS handle. Captured GEMMs read it, so it
+    /// has to stay mapped for the life of the device.
+    workspace: CudaSlice<u8>,
     rms_norm: CudaFunction,
     rope: CudaFunction,
     swiglu: CudaFunction,
@@ -302,15 +323,49 @@ pub enum GpuDType {
     Bf16,
 }
 
+/// Bind `workspace` to the handle. `cublasSetStream` clears this, so call it
+/// after [`CudaBlas::new`] and do not change the stream later.
+fn set_cublas_workspace(
+    blas: &CudaBlas,
+    workspace: &CudaSlice<u8>,
+    stream: &CudaStream,
+) -> Result<(), CudaError> {
+    let (ptr, _guard) = workspace.device_ptr(stream);
+    let status =
+        unsafe { cublasSetWorkspace_v2(*blas.handle(), ptr as *mut c_void, workspace.len()) };
+    if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        return Err(CudaError::new(format!(
+            "cublasSetWorkspace returned {status:?}"
+        )));
+    }
+    Ok(())
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        // The cuBLAS handle is destroyed with the device. Wait so an in-flight
+        // GEMM cannot outlive the workspace it reads.
+        let _ = self.stream.synchronize();
+    }
+}
+
 impl Device {
     /// Retain the primary context on GPU 0 and load the Flint PTX.
+    ///
+    /// Work goes to a non-blocking stream. The legacy default stream cannot be
+    /// captured, and each cuBLAS call on it waits for every other blocking
+    /// stream before returning.
     pub fn new() -> Result<Self, CudaError> {
         let ctx = CudaContext::new(0).map_err(|err| {
             CudaError::new(format!(
                 "create CUDA context on device 0 ({err}). A loaded NVIDIA driver is required to run, not to compile."
             ))
         })?;
-        let stream = ctx.default_stream();
+        // Safety: this device owns one stream and never overlaps launches.
+        // Automatic event tracking waits on events recorded outside a capture,
+        // which the driver rejects while the stream is capturing.
+        unsafe { ctx.disable_event_tracking() };
+        let stream = ctx.new_stream()?;
         let blas = CudaBlas::new(stream.clone())?;
         let status =
             unsafe { cublasSetMathMode(*blas.handle(), cublasMath_t::CUBLAS_PEDANTIC_MATH) };
@@ -319,10 +374,15 @@ impl Device {
                 "cublasSetMathMode(PEDANTIC) returned {status:?}"
             )));
         }
+        // `CudaBlas::new` calls `cublasSetStream`, which clears any workspace.
+        // Set it after that, or the first captured GEMM allocates.
+        let workspace = stream.alloc_zeros::<u8>(CUBLAS_WORKSPACE_BYTES)?;
+        set_cublas_workspace(&blas, &workspace, &stream)?;
         let module = ctx.load_module(Ptx::from_src(FLINT_PTX))?;
         Ok(Self {
             stream,
             blas,
+            workspace,
             rms_norm: function(&module, "flint_rms_norm")?,
             rope: function(&module, "flint_rope")?,
             swiglu: function(&module, "flint_swiglu")?,
@@ -430,12 +490,15 @@ impl Device {
 
     /// Copy `n` floats back to the host. Waits for the stream.
     pub fn download_f32(&self, buf: &F32Buf, n: usize) -> Result<Vec<f32>, CudaError> {
-        self.stream.synchronize()?;
         if n == 0 {
             return Ok(Vec::new());
         }
         let view = buf.view(n)?;
-        Ok(self.stream.clone_dtoh(&view)?)
+        // `clone_dtoh` queues the copy. On the legacy NULL stream a pageable
+        // D2H finished before the call returned; this stream does not.
+        let host = self.stream.clone_dtoh(&view)?;
+        self.stream.synchronize()?;
+        Ok(host)
     }
 
     /// `dst[0..n] = src[0..n]`.
@@ -2118,6 +2181,14 @@ impl Device {
 
     /// Record launches until [`Self::end_capture`]. The recorded work does not run.
     pub fn begin_capture(&self) -> Result<(), CudaError> {
+        if self.stream.cu_stream().is_null() {
+            return Err(CudaError::new(
+                "CUDA graph capture is not supported on the legacy default stream",
+            ));
+        }
+        // Captured GEMMs read this allocation. Touching it here keeps that
+        // dependency visible; dropping it would let cuBLAS allocate instead.
+        let _workspace_bytes = self.workspace.len();
         self.stream.begin_capture(
             cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
         )?;

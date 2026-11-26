@@ -5,7 +5,10 @@
 # Qwen2.5-0.5B-Instruct, builds Flint with `--features cuda`, runs the ignored
 # GPU-vs-CPU tests whose environment is present, serves the model twice
 # (`--dtype bf16` and `--dtype bf16 --quant int8`), and prints tok/s, TTFT,
-# and inter-token latency at concurrency 1, 8, and 32 for both.
+# and inter-token latency at concurrency 1, 8, and 32 for both. Server logs
+# are `/tmp/flint-gpu-serve-bf16.log` and `/tmp/flint-gpu-serve-int8.log`.
+# The summary says whether each mode kept CUDA graphs enabled, and the script
+# exits non-zero if either mode disables them.
 #
 # Usage (on the GPU machine, from anywhere):
 #   bash scripts/gpu_smoke.sh
@@ -20,13 +23,47 @@ cd "$(dirname "$0")/.."
 
 KERNEL_STATUS="not run"
 CORE_STATUS="not run"
+GRAPH_BF16="not run"
+GRAPH_INT8="not run"
 BENCH_ROWS=()
 
+serve_log() {
+  echo "/tmp/flint-gpu-serve-${1}.log"
+}
+
+graph_status() {
+  local log
+  log="$(serve_log "$1")"
+  if [[ ! -s "${log}" ]]; then
+    echo "not run"
+  elif grep -q "disabling CUDA graphs" "${log}"; then
+    echo "DISABLED"
+  else
+    echo "enabled"
+  fi
+}
+
+refresh_graphs() {
+  GRAPH_BF16="$(graph_status bf16)"
+  GRAPH_INT8="$(graph_status int8)"
+}
+
 summary() {
+  refresh_graphs
   echo
   echo "================ flint gpu smoke ================"
   printf "%-12s %s\n" "kernels" "${KERNEL_STATUS}"
   printf "%-12s %s\n" "core" "${CORE_STATUS}"
+  printf "%-12s %s\n" "graphs bf16" "${GRAPH_BF16}"
+  printf "%-12s %s\n" "graphs int8" "${GRAPH_INT8}"
+  if [[ "${GRAPH_BF16}" == "DISABLED" ]]; then
+    echo "bf16 CUDA graph capture failed ($(serve_log bf16)):"
+    grep "disabling CUDA graphs" "$(serve_log bf16)" || true
+  fi
+  if [[ "${GRAPH_INT8}" == "DISABLED" ]]; then
+    echo "int8 CUDA graph capture failed ($(serve_log int8)):"
+    grep "disabling CUDA graphs" "$(serve_log int8)" || true
+  fi
   printf "%-8s %-6s %12s %12s %12s %12s\n" "weights" "conc" "tok/s" "TTFT p50" "TTFT p99" "ITL p50"
   if [[ ${#BENCH_ROWS[@]} -eq 0 ]]; then
     printf "%-8s %-6s %12s %12s %12s %12s\n" "-" "-" "-" "-" "-" "-"
@@ -38,6 +75,7 @@ summary() {
     done
   fi
   echo "bench JSON: bench-results/gpu-{bf16,int8}-c{1,8,32}.json"
+  echo "server logs: $(serve_log bf16) $(serve_log int8)"
   echo "==============================================="
 }
 trap summary EXIT
@@ -153,6 +191,7 @@ trap 'cleanup; summary' EXIT
 
 wait_healthy() {
   local port="$1"
+  local log="$2"
   echo "waiting for http://127.0.0.1:${port}/health (GPU weight upload can take a minute)"
   local ready=0
   for _ in $(seq 1 300); do
@@ -162,14 +201,14 @@ wait_healthy() {
     fi
     if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
       echo "flint serve exited. Log:" >&2
-      cat /tmp/flint-gpu-serve.log >&2
+      cat "${log}" >&2
       exit 1
     fi
     sleep 2
   done
   if [[ "${ready}" -ne 1 ]]; then
     echo "server did not become healthy. Log:" >&2
-    cat /tmp/flint-gpu-serve.log >&2
+    cat "${log}" >&2
     exit 1
   fi
 }
@@ -178,8 +217,10 @@ wait_healthy() {
 bench_mode() {
   local label="$1"
   local quant="$2"
+  local log
+  log="$(serve_log "${label}")"
   cleanup
-  echo "== serve ${label} (dtype bf16, quant ${quant}) =="
+  echo "== serve ${label} (dtype bf16, quant ${quant}) log ${log} =="
   ./target/release/flint serve \
     --device cuda \
     --dtype bf16 \
@@ -190,9 +231,9 @@ bench_mode() {
     --max-num-seqs 32 \
     --max-batched-tokens 4096 \
     --num-blocks 512 \
-    >/tmp/flint-gpu-serve.log 2>&1 &
+    >"${log}" 2>&1 &
   SERVER_PID=$!
-  wait_healthy "${PORT}"
+  wait_healthy "${PORT}" "${log}"
   local c reqs row
   for c in 1 8 32; do
     reqs=8
@@ -233,12 +274,14 @@ PY
     BENCH_ROWS+=("${label} ${c} ${row}")
   done
   cleanup
+  refresh_graphs
 }
 
 mkdir -p bench-results
 bench_mode bf16 none
 bench_mode int8 int8
+refresh_graphs
 
-if [[ "${KERNEL_STATUS}" != "PASS" || "${CORE_STATUS}" != "PASS" ]]; then
+if [[ "${KERNEL_STATUS}" != "PASS" || "${CORE_STATUS}" != "PASS" || "${GRAPH_BF16}" == "DISABLED" || "${GRAPH_INT8}" == "DISABLED" ]]; then
   exit 1
 fi
