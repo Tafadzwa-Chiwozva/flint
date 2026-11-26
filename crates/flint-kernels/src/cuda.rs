@@ -80,6 +80,12 @@ pub struct I32Buf {
     cap: usize,
 }
 
+/// Device buffer of `i8` weight values.
+pub struct I8Buf {
+    data: Option<CudaSlice<i8>>,
+    cap: usize,
+}
+
 impl F32Buf {
     /// Empty allocation. [`Device::ensure_f32`] grows it on first use.
     #[must_use]
@@ -194,6 +200,29 @@ impl I32Buf {
     }
 }
 
+impl I8Buf {
+    /// Empty allocation.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self { data: None, cap: 0 }
+    }
+
+    fn view(&self, n: usize) -> Result<CudaView<'_, i8>, CudaError> {
+        let data = self
+            .data
+            .as_ref()
+            .ok_or_else(|| CudaError::new(format!("empty i8 buffer, need {n} elements")))?;
+        if n > self.cap {
+            return Err(CudaError::new(format!(
+                "i8 buffer cap {} is shorter than {n}",
+                self.cap
+            )));
+        }
+        data.try_slice(0..n)
+            .ok_or_else(|| CudaError::new(format!("i8 slice 0..{n} rejected")))
+    }
+}
+
 /// Static shape shared by the decode and prefill attention launches.
 #[derive(Clone, Copy, Debug)]
 pub struct AttnShape {
@@ -245,6 +274,13 @@ pub struct Device {
     paged_decode_bf16: CudaFunction,
     decode_combine_bf16: CudaFunction,
     paged_prefill_bf16: CudaFunction,
+    w8a_gemv_f32: CudaFunction,
+    w8a_gemv_bf16: CudaFunction,
+    w8a_gemv_bf16_f32: CudaFunction,
+    dequant_i8_f32: CudaFunction,
+    dequant_i8_bf16: CudaFunction,
+    embed_i8_f32: CudaFunction,
+    embed_i8_bf16: CudaFunction,
 }
 
 /// A captured decode step. Replayed with [`Device::launch_graph`].
@@ -313,6 +349,13 @@ impl Device {
             paged_decode_bf16: function(&module, "flint_paged_decode_bf16")?,
             decode_combine_bf16: function(&module, "flint_decode_combine_bf16")?,
             paged_prefill_bf16: function(&module, "flint_paged_prefill_bf16")?,
+            w8a_gemv_f32: function(&module, "flint_w8a_gemv_f32")?,
+            w8a_gemv_bf16: function(&module, "flint_w8a_gemv_bf16")?,
+            w8a_gemv_bf16_f32: function(&module, "flint_w8a_gemv_bf16_f32")?,
+            dequant_i8_f32: function(&module, "flint_dequant_i8_f32")?,
+            dequant_i8_bf16: function(&module, "flint_dequant_i8_bf16")?,
+            embed_i8_f32: function(&module, "flint_embed_i8_f32")?,
+            embed_i8_bf16: function(&module, "flint_embed_i8_bf16")?,
         })
     }
 
@@ -356,6 +399,18 @@ impl Device {
         }
         let slice = self.stream.clone_htod(data)?;
         Ok(F32Buf {
+            data: Some(slice),
+            cap: data.len(),
+        })
+    }
+
+    /// Copy `data` to a fresh device buffer of `i8`.
+    pub fn upload_i8(&self, data: &[i8]) -> Result<I8Buf, CudaError> {
+        if data.is_empty() {
+            return Ok(I8Buf::empty());
+        }
+        let slice = self.stream.clone_htod(data)?;
+        Ok(I8Buf {
             data: Some(slice),
             cap: data.len(),
         })
@@ -1120,6 +1175,8 @@ impl Device {
             rows,
             out_features,
             in_features,
+            out_features,
+            cudaDataType_t::CUDA_R_16BF,
             cudaDataType_t::CUDA_R_16BF,
         )?;
         drop((w_sync, x_sync, y_sync));
@@ -1152,6 +1209,8 @@ impl Device {
             rows,
             out_features,
             in_features,
+            out_features,
+            cudaDataType_t::CUDA_R_16BF,
             cudaDataType_t::CUDA_R_32F,
         )?;
         drop((w_sync, x_sync, y_sync));
@@ -1382,6 +1441,392 @@ impl Device {
         Ok(())
     }
 
+    /// `Y[:, col:col+tile] = X @ W_tile.T` with `Y` row-major `[rows, ldc]`.
+    ///
+    /// `w` is a contiguous dequantized tile `[tile_out, in_features]`. The
+    /// write uses cuBLAS leading dimension `ldc` so the tile lands in the
+    /// right columns without a second scatter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_nt_strided(
+        &self,
+        x: &F32Buf,
+        w: &F32Buf,
+        y: &mut F32Buf,
+        rows: usize,
+        tile_out: usize,
+        in_features: usize,
+        ldc: usize,
+        col: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 || tile_out == 0 {
+            return Ok(());
+        }
+        let x_v = x.view(rows * in_features)?;
+        let w_v = w.view(tile_out * in_features)?;
+        let mut y_v = y.view_mut(rows * ldc)?;
+        let (w_ptr, w_sync) = w_v.device_ptr(&self.stream);
+        let (x_ptr, x_sync) = x_v.device_ptr(&self.stream);
+        let (y_ptr, y_sync) = y_v.device_ptr_mut(&self.stream);
+        // f32 stays on cublasSgemm so the pedantic math mode (no TF32) matches
+        // the dense f32 GEMM. The pointer is the column-major start of this tile.
+        let y_off = y_ptr + (col * std::mem::size_of::<f32>()) as cudarc::driver::sys::CUdeviceptr;
+        let m = as_i32(tile_out, "gemm n")?;
+        let n = as_i32(rows, "gemm m")?;
+        let k = as_i32(in_features, "gemm k")?;
+        let ld = as_i32(in_features, "gemm lda")?;
+        let ldc_i = as_i32(ldc, "gemm ldc")?;
+        let alpha = 1.0_f32;
+        let beta = 0.0_f32;
+        unsafe {
+            cudarc::cublas::result::sgemm(
+                *self.blas.handle(),
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                m,
+                n,
+                k,
+                &alpha,
+                w_ptr as *const f32,
+                ld,
+                x_ptr as *const f32,
+                ld,
+                &beta,
+                y_off as *mut f32,
+                ldc_i,
+            )?;
+        }
+        drop((w_sync, x_sync, y_sync));
+        Ok(())
+    }
+
+    /// bf16 form of [`Self::gemm_nt_strided`]. `y` is bf16.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_strided(
+        &self,
+        x: &Bf16Buf,
+        w: &Bf16Buf,
+        y: &mut Bf16Buf,
+        rows: usize,
+        tile_out: usize,
+        in_features: usize,
+        ldc: usize,
+        col: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 || tile_out == 0 {
+            return Ok(());
+        }
+        let x_v = x.view(rows * in_features)?;
+        let w_v = w.view(tile_out * in_features)?;
+        let mut y_v = y.view_mut(rows * ldc)?;
+        let (w_ptr, w_sync) = w_v.device_ptr(&self.stream);
+        let (x_ptr, x_sync) = x_v.device_ptr(&self.stream);
+        let (y_ptr, y_sync) = y_v.device_ptr_mut(&self.stream);
+        let y_off = y_ptr + (col * std::mem::size_of::<u16>()) as cudarc::driver::sys::CUdeviceptr;
+        self.gemm_ex_raw(
+            w_ptr,
+            x_ptr,
+            y_off,
+            rows,
+            tile_out,
+            in_features,
+            ldc,
+            cudaDataType_t::CUDA_R_16BF,
+            cudaDataType_t::CUDA_R_16BF,
+        )?;
+        drop((w_sync, x_sync, y_sync));
+        Ok(())
+    }
+
+    /// bf16 inputs, f32 output, strided into a logit matrix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_f32_strided(
+        &self,
+        x: &Bf16Buf,
+        w: &Bf16Buf,
+        y: &mut F32Buf,
+        rows: usize,
+        tile_out: usize,
+        in_features: usize,
+        ldc: usize,
+        col: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 || tile_out == 0 {
+            return Ok(());
+        }
+        let x_v = x.view(rows * in_features)?;
+        let w_v = w.view(tile_out * in_features)?;
+        let mut y_v = y.view_mut(rows * ldc)?;
+        let (w_ptr, w_sync) = w_v.device_ptr(&self.stream);
+        let (x_ptr, x_sync) = x_v.device_ptr(&self.stream);
+        let (y_ptr, y_sync) = y_v.device_ptr_mut(&self.stream);
+        let y_off = y_ptr + (col * std::mem::size_of::<f32>()) as cudarc::driver::sys::CUdeviceptr;
+        self.gemm_ex_raw(
+            w_ptr,
+            x_ptr,
+            y_off,
+            rows,
+            tile_out,
+            in_features,
+            ldc,
+            cudaDataType_t::CUDA_R_16BF,
+            cudaDataType_t::CUDA_R_32F,
+        )?;
+        drop((w_sync, x_sync, y_sync));
+        Ok(())
+    }
+
+    /// Fused dequant GEMV. `Y = X @ dequant(Q).T` with f32 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn w8a_gemv_f32(
+        &self,
+        y: &mut F32Buf,
+        x: &F32Buf,
+        q: &I8Buf,
+        scales: &F32Buf,
+        rows: usize,
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 || out_features == 0 {
+            return Ok(());
+        }
+        let rows_i = as_i32(rows, "gemv rows")?;
+        let n_i = as_i32(out_features, "gemv n")?;
+        let k_i = as_i32(in_features, "gemv k")?;
+        let mut y_v = y.view_mut(rows * out_features)?;
+        let x_v = x.view(rows * in_features)?;
+        let q_v = q.view(out_features * in_features)?;
+        let s_v = scales.view(out_features)?;
+        let cfg = row_cfg(out_features, 128)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.w8a_gemv_f32)
+                .arg(&mut y_v)
+                .arg(&x_v)
+                .arg(&q_v)
+                .arg(&s_v)
+                .arg(&rows_i)
+                .arg(&n_i)
+                .arg(&k_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Fused dequant GEMV with bf16 activations and a bf16 result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn w8a_gemv_bf16(
+        &self,
+        y: &mut Bf16Buf,
+        x: &Bf16Buf,
+        q: &I8Buf,
+        scales: &F32Buf,
+        rows: usize,
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 || out_features == 0 {
+            return Ok(());
+        }
+        let rows_i = as_i32(rows, "gemv rows")?;
+        let n_i = as_i32(out_features, "gemv n")?;
+        let k_i = as_i32(in_features, "gemv k")?;
+        let mut y_v = y.view_mut(rows * out_features)?;
+        let x_v = x.view(rows * in_features)?;
+        let q_v = q.view(out_features * in_features)?;
+        let s_v = scales.view(out_features)?;
+        let cfg = row_cfg(out_features, 128)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.w8a_gemv_bf16)
+                .arg(&mut y_v)
+                .arg(&x_v)
+                .arg(&q_v)
+                .arg(&s_v)
+                .arg(&rows_i)
+                .arg(&n_i)
+                .arg(&k_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Fused dequant GEMV with bf16 activations and an f32 result (logits).
+    #[allow(clippy::too_many_arguments)]
+    pub fn w8a_gemv_bf16_f32(
+        &self,
+        y: &mut F32Buf,
+        x: &Bf16Buf,
+        q: &I8Buf,
+        scales: &F32Buf,
+        rows: usize,
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 || out_features == 0 {
+            return Ok(());
+        }
+        let rows_i = as_i32(rows, "gemv rows")?;
+        let n_i = as_i32(out_features, "gemv n")?;
+        let k_i = as_i32(in_features, "gemv k")?;
+        let mut y_v = y.view_mut(rows * out_features)?;
+        let x_v = x.view(rows * in_features)?;
+        let q_v = q.view(out_features * in_features)?;
+        let s_v = scales.view(out_features)?;
+        let cfg = row_cfg(out_features, 128)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.w8a_gemv_bf16_f32)
+                .arg(&mut y_v)
+                .arg(&x_v)
+                .arg(&q_v)
+                .arg(&s_v)
+                .arg(&rows_i)
+                .arg(&n_i)
+                .arg(&k_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Dequantize output rows `[src_row, src_row+rows)` into a contiguous f32 tile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dequant_i8_f32(
+        &self,
+        dst: &mut F32Buf,
+        q: &I8Buf,
+        scales: &F32Buf,
+        src_row: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        let rows_i = as_i32(rows, "dequant rows")?;
+        let cols_i = as_i32(cols, "dequant cols")?;
+        let src_i = as_i32(src_row, "dequant src")?;
+        let mut dst_v = dst.view_mut(rows * cols)?;
+        let q_v = q.view((src_row + rows) * cols)?;
+        let s_v = scales.view(src_row + rows)?;
+        let cfg = row_cfg(rows, 128)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.dequant_i8_f32)
+                .arg(&mut dst_v)
+                .arg(&q_v)
+                .arg(&s_v)
+                .arg(&rows_i)
+                .arg(&cols_i)
+                .arg(&src_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Dequantize output rows `[src_row, src_row+rows)` into a contiguous bf16 tile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dequant_i8_bf16(
+        &self,
+        dst: &mut Bf16Buf,
+        q: &I8Buf,
+        scales: &F32Buf,
+        src_row: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        let rows_i = as_i32(rows, "dequant rows")?;
+        let cols_i = as_i32(cols, "dequant cols")?;
+        let src_i = as_i32(src_row, "dequant src")?;
+        let mut dst_v = dst.view_mut(rows * cols)?;
+        let q_v = q.view((src_row + rows) * cols)?;
+        let s_v = scales.view(src_row + rows)?;
+        let cfg = row_cfg(rows, 128)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.dequant_i8_bf16)
+                .arg(&mut dst_v)
+                .arg(&q_v)
+                .arg(&s_v)
+                .arg(&rows_i)
+                .arg(&cols_i)
+                .arg(&src_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Gather INT8 embedding rows into f32, scaling each row by its channel scale.
+    pub fn embed_i8_f32(
+        &self,
+        out: &mut F32Buf,
+        table: &I8Buf,
+        scales: &F32Buf,
+        tokens: &I32Buf,
+        rows: usize,
+        hidden: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let rows_i = as_i32(rows, "embed rows")?;
+        let hidden_i = as_i32(hidden, "embed hidden")?;
+        let mut out_v = out.view_mut(rows * hidden)?;
+        let table_v = table.view(table.cap)?;
+        let scale_v = scales.view(scales.cap)?;
+        let tok_v = tokens.view(rows)?;
+        let cfg = row_cfg(rows, 128)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.embed_i8_f32)
+                .arg(&mut out_v)
+                .arg(&table_v)
+                .arg(&scale_v)
+                .arg(&tok_v)
+                .arg(&rows_i)
+                .arg(&hidden_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Gather INT8 embedding rows into bf16.
+    pub fn embed_i8_bf16(
+        &self,
+        out: &mut Bf16Buf,
+        table: &I8Buf,
+        scales: &F32Buf,
+        tokens: &I32Buf,
+        rows: usize,
+        hidden: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let rows_i = as_i32(rows, "embed rows")?;
+        let hidden_i = as_i32(hidden, "embed hidden")?;
+        let mut out_v = out.view_mut(rows * hidden)?;
+        let table_v = table.view(table.cap)?;
+        let scale_v = scales.view(scales.cap)?;
+        let tok_v = tokens.view(rows)?;
+        let cfg = row_cfg(rows, 128)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.embed_i8_bf16)
+                .arg(&mut out_v)
+                .arg(&table_v)
+                .arg(&scale_v)
+                .arg(&tok_v)
+                .arg(&rows_i)
+                .arg(&hidden_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn gemm_ex_raw(
         &self,
@@ -1391,11 +1836,14 @@ impl Device {
         rows: usize,
         out_features: usize,
         in_features: usize,
+        ldc: usize,
+        ab_type: cudaDataType_t,
         c_type: cudaDataType_t,
     ) -> Result<(), CudaError> {
         let m = as_i32(out_features, "gemm n")?;
         let n = as_i32(rows, "gemm m")?;
         let k = as_i32(in_features, "gemm k")?;
+        let ldc_i = as_i32(ldc, "gemm ldc")?;
         let alpha = 1.0_f32;
         let beta = 0.0_f32;
         unsafe {
@@ -1408,15 +1856,15 @@ impl Device {
                 k,
                 (&alpha) as *const f32 as *const c_void,
                 w_ptr as *const c_void,
-                cudaDataType_t::CUDA_R_16BF,
+                ab_type,
                 k,
                 x_ptr as *const c_void,
-                cudaDataType_t::CUDA_R_16BF,
+                ab_type,
                 k,
                 (&beta) as *const f32 as *const c_void,
                 y_ptr as *mut c_void,
                 c_type,
-                m,
+                ldc_i,
                 cublasComputeType_t::CUBLAS_COMPUTE_32F,
                 cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
             )?;
@@ -1702,6 +2150,16 @@ fn as_i32(n: usize, what: &str) -> Result<i32, CudaError> {
     i32::try_from(n).map_err(|_| CudaError::new(format!("{what} ({n}) does not fit in i32")))
 }
 
+fn row_cfg(rows: usize, block: u32) -> Result<LaunchConfig, CudaError> {
+    let rows = u32::try_from(rows)
+        .map_err(|_| CudaError::new(format!("launch rows {rows} exceed u32")))?;
+    Ok(LaunchConfig {
+        grid_dim: (rows.max(1), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    })
+}
+
 fn linear_cfg(n: usize) -> Result<LaunchConfig, CudaError> {
     let n =
         u32::try_from(n).map_err(|_| CudaError::new(format!("launch width {n} exceeds u32")))?;
@@ -1766,6 +2224,13 @@ mod tests {
             "flint_paged_decode_bf16",
             "flint_decode_combine_bf16",
             "flint_paged_prefill_bf16",
+            "flint_w8a_gemv_f32",
+            "flint_w8a_gemv_bf16",
+            "flint_w8a_gemv_bf16_f32",
+            "flint_dequant_i8_f32",
+            "flint_dequant_i8_bf16",
+            "flint_embed_i8_f32",
+            "flint_embed_i8_bf16",
         ] {
             assert!(FLINT_PTX.contains(name), "PTX is missing kernel {name}");
         }

@@ -6,7 +6,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use flint_core::{
-    apply_qwen_chat_template, ChatTurn, Error, FlintTokenizer, Model, ModelConfig, SamplingParams,
+    apply_qwen_chat_template, ChatTurn, Error, FlintTokenizer, Model, ModelConfig, QuantMode,
+    SamplingParams,
 };
 use hf_hub::api::sync::Api;
 
@@ -44,6 +45,24 @@ enum DTypeKind {
     F32,
     /// bf16 storage with f32 accumulation. CUDA only.
     Bf16,
+}
+
+/// Weight quantization. Activations stay at `--dtype`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum QuantKind {
+    /// Full-precision weights.
+    None,
+    /// Per-output-channel symmetric INT8 weights.
+    Int8,
+}
+
+impl QuantKind {
+    fn mode(self) -> QuantMode {
+        match self {
+            Self::None => QuantMode::None,
+            Self::Int8 => QuantMode::Int8,
+        }
+    }
 }
 
 fn resolve_dtype(device: DeviceKind, dtype: DTypeKind) -> anyhow::Result<ExecDType> {
@@ -133,6 +152,12 @@ struct ModelArgs {
     /// Weight storage. `auto` is f32 on CPU and bf16 on CUDA.
     #[arg(long, value_enum, default_value = "auto")]
     dtype: DTypeKind,
+    /// Linear-weight quantization. `none` keeps the checkpoint dtype.
+    ///
+    /// `int8` is per-channel symmetric weight-only INT8. Norms and biases stay
+    /// full precision, and activations follow `--dtype`.
+    #[arg(long, value_enum, default_value = "none")]
+    quant: QuantKind,
 }
 
 #[derive(Parser)]
@@ -380,7 +405,7 @@ fn logits(args: LogitsArgs) -> anyhow::Result<()> {
     require_device(args.model.device)?;
     resolve_dtype(args.model.device, args.model.dtype)?;
     let dir = resolve_dir(&args.model)?;
-    let model = Model::load(&dir)?;
+    let model = Model::load_with(&dir, args.model.quant.mode())?;
     let tokenizer = FlintTokenizer::open(&dir)?;
     let encoded: Vec<(String, Vec<u32>)> = args
         .prompt
@@ -500,12 +525,12 @@ fn score_cuda(
 
 fn load_pair(args: &ModelArgs) -> anyhow::Result<(Model, Arc<dyn TextCodec>, String)> {
     if args.dummy {
-        let model = Model::from_random(&ModelConfig::dummy(), 1)?;
+        let model = Model::from_random_with(&ModelConfig::dummy(), 1, args.quant.mode())?;
         let name = "flint-dummy".to_string();
         return Ok((model, Arc::new(ByteCodec), name));
     }
     let dir = resolve_dir(args)?;
-    let model = Model::load(&dir)?;
+    let model = Model::load_with(&dir, args.quant.mode())?;
     let tokenizer = FlintTokenizer::open(&dir)?;
     let name = args.model.clone();
     Ok((model, Arc::new(HfCodec { inner: tokenizer }), name))

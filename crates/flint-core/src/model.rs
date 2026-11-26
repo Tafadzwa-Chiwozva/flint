@@ -15,8 +15,9 @@ use rand::{Rng, SeedableRng};
 
 use crate::config::ModelConfig;
 use crate::error::Error;
-use crate::gemm::linear;
+use crate::gemm::{linear, linear_i8};
 use crate::ops::{add_vec, apply_rope, inv_freq, rope_angles, swiglu};
+use crate::quant::{PackedWeight, QuantMode};
 use crate::weights::TensorMap;
 
 /// One sequence inside a batched forward.
@@ -45,23 +46,54 @@ pub struct ForwardOutput {
 }
 
 struct Linear {
-    weight: Vec<f32>,
+    weight: PackedWeight,
     bias: Option<Vec<f32>>,
     out_features: usize,
     in_features: usize,
 }
 
 impl Linear {
+    fn from_f32(
+        weight: Vec<f32>,
+        bias: Option<Vec<f32>>,
+        out_features: usize,
+        in_features: usize,
+    ) -> Self {
+        Self {
+            weight: PackedWeight::f32(weight),
+            bias,
+            out_features,
+            in_features,
+        }
+    }
+
     fn apply(&self, x: &[f32], y: &mut [f32], rows: usize) {
-        linear(
-            &self.weight,
-            self.bias.as_deref(),
-            x,
-            y,
-            rows,
-            self.out_features,
-            self.in_features,
-        );
+        match &self.weight {
+            PackedWeight::F32(weight) => linear(
+                weight,
+                self.bias.as_deref(),
+                x,
+                y,
+                rows,
+                self.out_features,
+                self.in_features,
+            ),
+            PackedWeight::Int8 { q, scales } => linear_i8(
+                q,
+                scales,
+                self.bias.as_deref(),
+                x,
+                y,
+                rows,
+                self.out_features,
+                self.in_features,
+            ),
+        }
+    }
+
+    fn quantize(&mut self) {
+        let weight = std::mem::replace(&mut self.weight, PackedWeight::f32(Vec::new()));
+        self.weight = weight.quantize(self.out_features, self.in_features);
     }
 }
 
@@ -116,19 +148,29 @@ impl Scratch {
 /// A loaded causal language model.
 pub struct Model {
     cfg: ModelConfig,
-    embed: Vec<f32>,
+    embed: PackedWeight,
     layers: Vec<LayerWeights>,
     final_norm: Vec<f32>,
     /// `None` when the LM head is tied to [`Self::embed`].
     lm_head: Option<Linear>,
     inv_freq: Vec<f32>,
     eos_ids: Vec<u32>,
+    quant: QuantMode,
     scratch: Scratch,
 }
 
 impl Model {
     /// Load `config.json`, optional `generation_config.json`, and safetensors.
     pub fn load(dir: &Path) -> Result<Self, Error> {
+        Self::load_with(dir, QuantMode::None)
+    }
+
+    /// Load a checkpoint and quantize linear weights when `quant` asks for it.
+    ///
+    /// Norms and biases stay f32. A tied LM head quantizes the embedding matrix,
+    /// which is that head. An untied head is quantized on its own and the
+    /// token embedding stays f32.
+    pub fn load_with(dir: &Path, quant: QuantMode) -> Result<Self, Error> {
         let config_path = dir.join("config.json");
         let text = std::fs::read_to_string(&config_path)
             .map_err(|err| Error::Config(format!("read {}: {err}", config_path.display())))?;
@@ -147,11 +189,14 @@ impl Model {
             &[]
         };
         let mut tensors = TensorMap::load_dir(dir, skip)?;
-        let model = assemble(cfg, &mut tensors, eos)?;
+        let mut model = assemble(cfg, &mut tensors, eos)?;
+        apply_quant_model(&mut model, quant);
         tracing::info!(
             layers = model.cfg.num_hidden_layers,
             params = model.parameter_count(),
             vocab = model.cfg.vocab_size,
+            ?quant,
+            matmul_bytes = model.matmul_weight_bytes(),
             "model ready"
         );
         Ok(model)
@@ -159,6 +204,11 @@ impl Model {
 
     /// Deterministic random weights for tests and `flint serve --dummy`.
     pub fn from_random(cfg: &ModelConfig, seed: u64) -> Result<Self, Error> {
+        Self::from_random_with(cfg, seed, QuantMode::None)
+    }
+
+    /// Random weights, then the same quantization [`Self::load_with`] applies.
+    pub fn from_random_with(cfg: &ModelConfig, seed: u64, quant: QuantMode) -> Result<Self, Error> {
         cfg.validate()?;
         let mut rng = StdRng::seed_from_u64(seed);
         let draw = |rng: &mut StdRng, n: usize, scale: f32| -> Vec<f32> {
@@ -173,62 +223,42 @@ impl Model {
             layers.push(LayerWeights {
                 input_norm: vec![1.0; hidden],
                 post_norm: vec![1.0; hidden],
-                q: Linear {
-                    weight: draw(&mut rng, qo * hidden, 0.05),
-                    bias: Some(draw(&mut rng, qo, 0.01)),
-                    out_features: qo,
-                    in_features: hidden,
-                },
-                k: Linear {
-                    weight: draw(&mut rng, kv * hidden, 0.05),
-                    bias: Some(draw(&mut rng, kv, 0.01)),
-                    out_features: kv,
-                    in_features: hidden,
-                },
-                v: Linear {
-                    weight: draw(&mut rng, kv * hidden, 0.05),
-                    bias: Some(draw(&mut rng, kv, 0.01)),
-                    out_features: kv,
-                    in_features: hidden,
-                },
-                o: Linear {
-                    weight: draw(&mut rng, hidden * qo, 0.05),
-                    bias: None,
-                    out_features: hidden,
-                    in_features: qo,
-                },
-                gate: Linear {
-                    weight: draw(&mut rng, inter * hidden, 0.05),
-                    bias: None,
-                    out_features: inter,
-                    in_features: hidden,
-                },
-                up: Linear {
-                    weight: draw(&mut rng, inter * hidden, 0.05),
-                    bias: None,
-                    out_features: inter,
-                    in_features: hidden,
-                },
-                down: Linear {
-                    weight: draw(&mut rng, hidden * inter, 0.05),
-                    bias: None,
-                    out_features: hidden,
-                    in_features: inter,
-                },
+                q: Linear::from_f32(
+                    draw(&mut rng, qo * hidden, 0.05),
+                    Some(draw(&mut rng, qo, 0.01)),
+                    qo,
+                    hidden,
+                ),
+                k: Linear::from_f32(
+                    draw(&mut rng, kv * hidden, 0.05),
+                    Some(draw(&mut rng, kv, 0.01)),
+                    kv,
+                    hidden,
+                ),
+                v: Linear::from_f32(
+                    draw(&mut rng, kv * hidden, 0.05),
+                    Some(draw(&mut rng, kv, 0.01)),
+                    kv,
+                    hidden,
+                ),
+                o: Linear::from_f32(draw(&mut rng, hidden * qo, 0.05), None, hidden, qo),
+                gate: Linear::from_f32(draw(&mut rng, inter * hidden, 0.05), None, inter, hidden),
+                up: Linear::from_f32(draw(&mut rng, inter * hidden, 0.05), None, inter, hidden),
+                down: Linear::from_f32(draw(&mut rng, hidden * inter, 0.05), None, hidden, inter),
             });
         }
-        let embed = draw(&mut rng, cfg.vocab_size * hidden, 0.05);
+        let embed = PackedWeight::f32(draw(&mut rng, cfg.vocab_size * hidden, 0.05));
         let lm_head = if cfg.tie_word_embeddings {
             None
         } else {
-            Some(Linear {
-                weight: draw(&mut rng, cfg.vocab_size * hidden, 0.05),
-                bias: None,
-                out_features: cfg.vocab_size,
-                in_features: hidden,
-            })
+            Some(Linear::from_f32(
+                draw(&mut rng, cfg.vocab_size * hidden, 0.05),
+                None,
+                cfg.vocab_size,
+                hidden,
+            ))
         };
-        Ok(Self {
+        let mut model = Self {
             inv_freq: inv_freq(cfg.head_dim(), cfg.rope_theta as f32),
             eos_ids: cfg.eos_ids(),
             cfg: cfg.clone(),
@@ -236,8 +266,11 @@ impl Model {
             layers,
             final_norm: vec![1.0; hidden],
             lm_head,
+            quant: QuantMode::None,
             scratch: Scratch::new(),
-        })
+        };
+        apply_quant_model(&mut model, quant);
+        Ok(model)
     }
 
     /// Borrowed architecture.
@@ -255,9 +288,9 @@ impl Model {
     /// Trainable parameters. A tied LM head is counted once.
     #[must_use]
     pub fn parameter_count(&self) -> usize {
-        let mut total = self.embed.len() + self.final_norm.len();
+        let mut total = self.embed.elements() + self.final_norm.len();
         if let Some(head) = &self.lm_head {
-            total += head.weight.len();
+            total += head.weight.elements();
         }
         for layer in &self.layers {
             total += layer.input_norm.len() + layer.post_norm.len();
@@ -270,10 +303,64 @@ impl Model {
                 &layer.up,
                 &layer.down,
             ] {
-                total += linear.weight.len();
+                total += linear.weight.elements();
                 if let Some(bias) = &linear.bias {
                     total += bias.len();
                 }
+            }
+        }
+        total
+    }
+
+    /// Quantization chosen at load. [`QuantMode::None`] leaves every weight f32.
+    #[must_use]
+    pub fn quant_mode(&self) -> QuantMode {
+        self.quant
+    }
+
+    /// Bytes of embedding and linear weights, including INT8 scales.
+    ///
+    /// Norms and biases are excluded. This is the storage that `--quant int8`
+    /// shrinks: about 4× versus f32, and about 2× versus bf16, plus one f32
+    /// scale per output channel.
+    #[must_use]
+    pub fn matmul_weight_bytes(&self) -> usize {
+        let mut total = self.embed.storage_bytes();
+        if let Some(head) = &self.lm_head {
+            total += head.weight.storage_bytes();
+        }
+        for layer in &self.layers {
+            for linear in [
+                &layer.q,
+                &layer.k,
+                &layer.v,
+                &layer.o,
+                &layer.gate,
+                &layer.up,
+                &layer.down,
+            ] {
+                total += linear.weight.storage_bytes();
+            }
+        }
+        total
+    }
+
+    /// Bytes of every host weight buffer: embeddings, linears, norms, and biases.
+    #[must_use]
+    pub fn weight_storage_bytes(&self) -> usize {
+        let mut total = self.matmul_weight_bytes() + self.final_norm.len() * 4;
+        for layer in &self.layers {
+            total += (layer.input_norm.len() + layer.post_norm.len()) * 4;
+            for linear in [
+                &layer.q,
+                &layer.k,
+                &layer.v,
+                &layer.o,
+                &layer.gate,
+                &layer.up,
+                &layer.down,
+            ] {
+                total += linear.bias.as_ref().map(|bias| bias.len() * 4).unwrap_or(0);
             }
         }
         total
@@ -390,9 +477,8 @@ impl Model {
         if let Some(head) = &self.lm_head {
             head.apply(&last_hidden, &mut logits, 1);
         } else {
-            linear(
+            apply_packed(
                 &self.embed,
-                None,
                 &last_hidden,
                 &mut logits,
                 1,
@@ -497,12 +583,12 @@ fn resize(buf: &mut Vec<f32>, len: usize) {
 }
 
 fn embed_tokens(
-    table: &[f32],
+    table: &PackedWeight,
     tokens: &[u32],
     hidden: usize,
     out: &mut [f32],
 ) -> Result<(), Error> {
-    let vocab = table.len() / hidden;
+    let vocab = table.elements() / hidden;
     for (row, &id) in tokens.iter().enumerate() {
         if id as usize >= vocab {
             return Err(Error::Inference(format!(
@@ -511,9 +597,37 @@ fn embed_tokens(
         }
         let src = id as usize * hidden;
         let dst = row * hidden;
-        out[dst..dst + hidden].copy_from_slice(&table[src..src + hidden]);
+        match table {
+            PackedWeight::F32(values) => {
+                out[dst..dst + hidden].copy_from_slice(&values[src..src + hidden]);
+            }
+            PackedWeight::Int8 { q, scales } => {
+                let scale = scales[id as usize];
+                for col in 0..hidden {
+                    out[dst + col] = f32::from(q[src + col]) * scale;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn apply_packed(
+    weight: &PackedWeight,
+    x: &[f32],
+    y: &mut [f32],
+    rows: usize,
+    out_features: usize,
+    in_features: usize,
+) {
+    match weight {
+        PackedWeight::F32(values) => {
+            linear(values, None, x, y, rows, out_features, in_features);
+        }
+        PackedWeight::Int8 { q, scales } => {
+            linear_i8(q, scales, None, x, y, rows, out_features, in_features);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -683,17 +797,18 @@ fn assemble(cfg: ModelConfig, tensors: &mut TensorMap, eos_ids: Vec<u32>) -> Res
     let inter = cfg.intermediate_size;
     let qo = cfg.qo_dim();
     let kv = cfg.kv_dim();
-    let embed = tensors.take("model.embed_tokens.weight", cfg.vocab_size * hidden)?;
+    let embed =
+        PackedWeight::f32(tensors.take("model.embed_tokens.weight", cfg.vocab_size * hidden)?);
     let final_norm = tensors.take("model.norm.weight", hidden)?;
     let lm_head = if cfg.tie_word_embeddings {
         None
     } else {
-        Some(Linear {
-            weight: tensors.take("lm_head.weight", cfg.vocab_size * hidden)?,
-            bias: None,
-            out_features: cfg.vocab_size,
-            in_features: hidden,
-        })
+        Some(Linear::from_f32(
+            tensors.take("lm_head.weight", cfg.vocab_size * hidden)?,
+            None,
+            cfg.vocab_size,
+            hidden,
+        ))
     };
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
     for i in 0..cfg.num_hidden_layers {
@@ -718,8 +833,36 @@ fn assemble(cfg: ModelConfig, tensors: &mut TensorMap, eos_ids: Vec<u32>) -> Res
         layers,
         final_norm,
         lm_head,
+        quant: QuantMode::None,
         scratch: Scratch::new(),
     })
+}
+
+fn apply_quant_model(model: &mut Model, quant: QuantMode) {
+    model.quant = quant;
+    if quant != QuantMode::Int8 {
+        return;
+    }
+    // A tied head is the embedding matrix. An untied head is its own linear,
+    // and the token table stays f32 so lookups are exact.
+    if model.lm_head.is_none() {
+        let rows = model.cfg.vocab_size;
+        let cols = model.cfg.hidden_size;
+        let embed = std::mem::replace(&mut model.embed, PackedWeight::f32(Vec::new()));
+        model.embed = embed.quantize(rows, cols);
+    }
+    if let Some(head) = model.lm_head.as_mut() {
+        head.quantize();
+    }
+    for layer in &mut model.layers {
+        layer.q.quantize();
+        layer.k.quantize();
+        layer.v.quantize();
+        layer.o.quantize();
+        layer.gate.quantize();
+        layer.up.quantize();
+        layer.down.quantize();
+    }
 }
 
 fn take_linear(
@@ -728,12 +871,12 @@ fn take_linear(
     out_features: usize,
     in_features: usize,
 ) -> Result<Linear, Error> {
-    Ok(Linear {
-        weight: tensors.take(&format!("{prefix}.weight"), out_features * in_features)?,
-        bias: tensors.take_optional(&format!("{prefix}.bias"), out_features)?,
+    Ok(Linear::from_f32(
+        tensors.take(&format!("{prefix}.weight"), out_features * in_features)?,
+        tensors.take_optional(&format!("{prefix}.bias"), out_features)?,
         out_features,
         in_features,
-    })
+    ))
 }
 
 fn read_generation_eos(path: &Path) -> Vec<u32> {
@@ -1008,7 +1151,10 @@ mod tests {
         std::fs::write(dir.join("model.safetensors"), blob).unwrap();
 
         let loaded = Model::load(&dir).unwrap();
-        assert!((loaded.embed[0] - 1.5).abs() < 1e-6);
+        let PackedWeight::F32(embed) = &loaded.embed else {
+            panic!("unquantized load stored int8 embeddings");
+        };
+        assert!((embed[0] - 1.5).abs() < 1e-6);
         assert!(loaded.eos_token_ids().is_empty());
         let mut model = loaded;
         let logits = model.forward_prompt(&[0, 1, 2], 2).unwrap().logits.unwrap();
@@ -1060,5 +1206,116 @@ mod tests {
                 "max abs logit diff {max} >= 1e-3 (bf16 upcast plus f32 GEMM)"
             );
         }
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let mut dot = 0.0_f32;
+        let mut na = 0.0_f32;
+        let mut nb = 0.0_f32;
+        for (x, y) in a.iter().zip(b) {
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        dot / (na.sqrt() * nb.sqrt())
+    }
+
+    fn argmax(values: &[f32]) -> usize {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn int8_forward_matches_f32_and_shrinks_weights() {
+        let cfg = tiny();
+        let tokens = [1_u32, 4, 9, 2, 8, 3];
+        let mut full = Model::from_random(&cfg, 7).unwrap();
+        let mut quant = Model::from_random_with(&cfg, 7, QuantMode::Int8).unwrap();
+        assert_eq!(full.quant_mode(), QuantMode::None);
+        assert_eq!(quant.quant_mode(), QuantMode::Int8);
+        assert_eq!(full.parameter_count(), quant.parameter_count());
+        let dense = full.matmul_weight_bytes();
+        let packed = quant.matmul_weight_bytes();
+        assert!(
+            packed * 2 < dense,
+            "int8 matmul storage {packed} is not under half of f32 {dense}"
+        );
+        let dense_extra = full.weight_storage_bytes() - dense;
+        let packed_extra = quant.weight_storage_bytes() - packed;
+        assert_eq!(
+            dense_extra, packed_extra,
+            "norms and biases must stay full precision"
+        );
+        assert!(matches!(
+            quant.embed,
+            crate::quant::PackedWeight::Int8 { .. }
+        ));
+        assert!(matches!(
+            quant.layers[0].q.weight,
+            crate::quant::PackedWeight::Int8 { .. }
+        ));
+        assert_eq!(
+            quant.layers[0].q.bias.as_ref().map(Vec::len),
+            full.layers[0].q.bias.as_ref().map(Vec::len)
+        );
+
+        let expect = full.forward_prompt(&tokens, 4).unwrap().logits.unwrap();
+        let got = quant.forward_prompt(&tokens, 4).unwrap().logits.unwrap();
+        assert!(got.iter().all(|v| v.is_finite()));
+        let sim = cosine(&got, &expect);
+        assert!(sim > 0.99, "cosine {sim}");
+        assert_eq!(argmax(&got), argmax(&expect));
+
+        // A second decode step uses the same W8A32 matmul as prefill.
+        let mut decoded = Model::from_random_with(&cfg, 7, QuantMode::Int8).unwrap();
+        let n_blocks = tokens.len().div_ceil(4);
+        let mut cache = PagedKvCache::with_dims(
+            n_blocks,
+            4,
+            cfg.num_hidden_layers,
+            cfg.num_key_value_heads,
+            cfg.head_dim(),
+        )
+        .unwrap();
+        let table: Vec<u32> = (0..n_blocks as u32).collect();
+        decoded
+            .forward(&tokens[..tokens.len() - 1], 0, &mut cache, &table, false)
+            .unwrap();
+        let step = decoded
+            .forward(
+                &tokens[tokens.len() - 1..],
+                tokens.len() - 1,
+                &mut cache,
+                &table,
+                true,
+            )
+            .unwrap()
+            .logits
+            .unwrap();
+        assert_close(&step, &got, 1e-4);
+    }
+
+    #[test]
+    fn int8_untied_head_keeps_embeddings_dense() {
+        let mut cfg = tiny();
+        cfg.tie_word_embeddings = false;
+        let mut full = Model::from_random(&cfg, 3).unwrap();
+        let mut quant = Model::from_random_with(&cfg, 3, QuantMode::Int8).unwrap();
+        assert!(matches!(quant.embed, crate::quant::PackedWeight::F32(_)));
+        assert!(matches!(
+            quant.lm_head.as_ref().unwrap().weight,
+            crate::quant::PackedWeight::Int8 { .. }
+        ));
+        assert!(quant.matmul_weight_bytes() * 2 < full.matmul_weight_bytes());
+        let tokens = [2_u32, 5, 1, 7];
+        let expect = full.forward_prompt(&tokens, 4).unwrap().logits.unwrap();
+        let got = quant.forward_prompt(&tokens, 4).unwrap().logits.unwrap();
+        let sim = cosine(&got, &expect);
+        assert!(sim > 0.99, "cosine {sim}");
+        assert_eq!(argmax(&got), argmax(&expect));
     }
 }

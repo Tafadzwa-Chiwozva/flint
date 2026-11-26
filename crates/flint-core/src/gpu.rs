@@ -13,17 +13,24 @@
 use std::collections::HashMap;
 
 use flint_kernels::cuda::{
-    AttnShape, Bf16Buf, CapturedGraph, Device, F32Buf, GpuDType, I32Buf, MAX_HEAD_DIM,
+    AttnShape, Bf16Buf, CapturedGraph, Device, F32Buf, GpuDType, I32Buf, I8Buf, MAX_HEAD_DIM,
 };
 use flint_kernels::CacheGeometry;
 
 use crate::config::ModelConfig;
 use crate::error::Error;
 use crate::model::{ForwardChunk, ForwardOutput};
+use crate::quant::PackedWeight;
+
+/// Rows at or below this use the fused dequant GEMV, including every CUDA-graph
+/// decode width. Larger prefill rows dequantize a tile and call cuBLAS.
+const INT8_GEMV_MAX_ROWS: usize = 64;
+/// Output channels dequantized per cuBLAS tile. Scratch is `tile * max_k`.
+const INT8_DEQUANT_TILE: usize = 2048;
 
 /// Host weights moved out of [`crate::Model`] before the upload.
 pub(crate) struct OwnedLinear {
-    pub weight: Vec<f32>,
+    pub weight: PackedWeight,
     pub bias: Option<Vec<f32>>,
     pub out_features: usize,
     pub in_features: usize,
@@ -45,7 +52,7 @@ pub(crate) struct OwnedLayer {
 /// Everything [`GpuModel::from_owned`] uploads.
 pub(crate) struct OwnedWeights {
     pub cfg: ModelConfig,
-    pub embed: Vec<f32>,
+    pub embed: PackedWeight,
     pub layers: Vec<OwnedLayer>,
     pub final_norm: Vec<f32>,
     pub lm_head: Option<OwnedLinear>,
@@ -68,8 +75,13 @@ impl Act {
     }
 }
 
+enum DevWeight {
+    Dense(Act),
+    Int8 { q: I8Buf, scales: F32Buf },
+}
+
 struct DevLinear {
-    weight: Act,
+    weight: DevWeight,
     bias: Option<Act>,
     out_features: usize,
     in_features: usize,
@@ -101,6 +113,8 @@ struct Scratch {
     gathered: Act,
     /// Logits stay f32 in both modes so the sampler reads full precision.
     logits: F32Buf,
+    /// Dequantized weight tile for prefill INT8 GEMMs. Decode uses the fused GEMV.
+    dequant: Act,
     /// Split-K workspace. Unused when `splits == 1`.
     partial_acc: F32Buf,
     partial_max: F32Buf,
@@ -121,6 +135,7 @@ impl Scratch {
             gate: Act::empty(dtype),
             up: Act::empty(dtype),
             gathered: Act::empty(dtype),
+            dequant: Act::empty(dtype),
             logits: F32Buf::empty(),
             partial_acc: F32Buf::empty(),
             partial_max: F32Buf::empty(),
@@ -192,7 +207,7 @@ pub struct GpuModel {
     cfg: ModelConfig,
     dev: Device,
     dtype: GpuDType,
-    embed: Act,
+    embed: DevWeight,
     layers: Vec<DevLayer>,
     final_norm: Act,
     lm_head: Option<DevLinear>,
@@ -255,7 +270,8 @@ impl GpuModel {
             .ok_or_else(|| Error::Inference("GPU KV cache size overflowed".into()))?;
         let key_cache = alloc_act(&dev, dtype, elems)?;
         let value_cache = alloc_act(&dev, dtype, elems)?;
-        let embed = upload_act(&dev, dtype, &owned.embed)?;
+        let (matmul_elems, matmul_bytes, max_k, quant_i8) = weight_stats(&owned);
+        let embed = upload_weight(&dev, dtype, owned.embed)?;
         let final_norm = upload_act(&dev, dtype, &owned.final_norm)?;
         let inv_freq = dev.upload_f32(&owned.inv_freq).map_err(gpu_err)?;
         let lm_head = owned
@@ -276,11 +292,21 @@ impl GpuModel {
                 down: upload_linear(&dev, dtype, layer.down)?,
             });
         }
+        let mut scratch = Scratch::empty(dtype);
+        if quant_i8 {
+            // Prefill dequants at most one tile. Decode never touches this buffer,
+            // so growing it cannot invalidate a captured graph.
+            let tile = INT8_DEQUANT_TILE.max(1);
+            scratch.dequant = alloc_act(&dev, dtype, tile * max_k)?;
+        }
         tracing::info!(
             layers = owned.cfg.num_hidden_layers,
             num_blocks,
             block_size,
             ?dtype,
+            quant = if quant_i8 { "int8" } else { "none" },
+            matmul_bytes,
+            bf16_bytes = matmul_elems * 2,
             "GPU weights uploaded"
         );
         Ok(Self {
@@ -304,7 +330,7 @@ impl GpuModel {
             inv_freq,
             key_cache,
             value_cache,
-            scratch: Scratch::empty(dtype),
+            scratch,
             meta: Meta::default(),
             graphs: HashMap::new(),
             graphs_ok: true,
@@ -541,15 +567,27 @@ impl GpuModel {
     }
 
     fn embed_plan(&mut self, plan: &BatchPlan<'_>) -> Result<(), Error> {
-        embed_act(
-            &self.dev,
-            self.dtype,
-            &mut self.scratch.hidden,
-            &self.embed,
-            plan.tokens,
-            plan.rows,
-            self.hidden,
-        )
+        match &self.embed {
+            DevWeight::Dense(table) => embed_act(
+                &self.dev,
+                self.dtype,
+                &mut self.scratch.hidden,
+                table,
+                plan.tokens,
+                plan.rows,
+                self.hidden,
+            ),
+            DevWeight::Int8 { q, scales } => embed_i8(
+                &self.dev,
+                self.dtype,
+                &mut self.scratch.hidden,
+                q,
+                scales,
+                plan.tokens,
+                plan.rows,
+                self.hidden,
+            ),
+        }
     }
 
     fn run_layer(&mut self, layer_idx: usize, plan: &BatchPlan) -> Result<(), Error> {
@@ -602,6 +640,7 @@ impl GpuModel {
             &self.layers[layer_idx].q,
             &self.scratch.normed,
             &mut self.scratch.q,
+            &mut self.scratch.dequant,
             rows,
         )?;
         apply_linear(
@@ -610,6 +649,7 @@ impl GpuModel {
             &self.layers[layer_idx].k,
             &self.scratch.normed,
             &mut self.scratch.k,
+            &mut self.scratch.dequant,
             rows,
         )?;
         apply_linear(
@@ -618,6 +658,7 @@ impl GpuModel {
             &self.layers[layer_idx].v,
             &self.scratch.normed,
             &mut self.scratch.v,
+            &mut self.scratch.dequant,
             rows,
         )?;
         rope_act(
@@ -695,6 +736,7 @@ impl GpuModel {
             &self.layers[layer_idx].o,
             &self.scratch.attn,
             &mut self.scratch.proj,
+            &mut self.scratch.dequant,
             rows,
         )?;
         // Post-attention residual and the MLP norm are one launch.
@@ -717,6 +759,7 @@ impl GpuModel {
             &self.layers[layer_idx].gate,
             &self.scratch.normed,
             &mut self.scratch.gate,
+            &mut self.scratch.dequant,
             rows,
         )?;
         apply_linear(
@@ -725,6 +768,7 @@ impl GpuModel {
             &self.layers[layer_idx].up,
             &self.scratch.normed,
             &mut self.scratch.up,
+            &mut self.scratch.dequant,
             rows,
         )?;
         swiglu_act(
@@ -740,6 +784,7 @@ impl GpuModel {
             &self.layers[layer_idx].down,
             &self.scratch.gate,
             &mut self.scratch.proj,
+            &mut self.scratch.dequant,
             rows,
         )?;
         // `residual` still holds the pre-attention value. Refresh it, then add.
@@ -873,6 +918,7 @@ impl GpuModel {
                 &self.scratch.normed,
                 &head.weight,
                 &mut self.scratch.logits,
+                &mut self.scratch.dequant,
                 n,
                 head.out_features,
                 head.in_features,
@@ -894,6 +940,7 @@ impl GpuModel {
                 &self.scratch.normed,
                 &self.embed,
                 &mut self.scratch.logits,
+                &mut self.scratch.dequant,
                 n,
                 vocab,
                 hidden,
@@ -984,17 +1031,57 @@ fn upload_act(dev: &Device, dtype: GpuDType, data: &[f32]) -> Result<Act, Error>
     }
 }
 
+fn upload_weight(dev: &Device, dtype: GpuDType, weight: PackedWeight) -> Result<DevWeight, Error> {
+    match weight {
+        PackedWeight::F32(values) => Ok(DevWeight::Dense(upload_act(dev, dtype, &values)?)),
+        PackedWeight::Int8 { q, scales } => Ok(DevWeight::Int8 {
+            q: dev.upload_i8(&q).map_err(gpu_err)?,
+            scales: dev.upload_f32(&scales).map_err(gpu_err)?,
+        }),
+    }
+}
+
 fn upload_linear(dev: &Device, dtype: GpuDType, lin: OwnedLinear) -> Result<DevLinear, Error> {
     let bias = match lin.bias {
         Some(values) => Some(upload_act(dev, dtype, &values)?),
         None => None,
     };
     Ok(DevLinear {
-        weight: upload_act(dev, dtype, &lin.weight)?,
+        weight: upload_weight(dev, dtype, lin.weight)?,
         bias,
         out_features: lin.out_features,
         in_features: lin.in_features,
     })
+}
+
+fn weight_stats(owned: &OwnedWeights) -> (usize, usize, usize, bool) {
+    let mut elems = owned.embed.elements();
+    let mut bytes = owned.embed.storage_bytes();
+    let mut max_k = owned.cfg.hidden_size.max(1);
+    let mut int8 = matches!(owned.embed, PackedWeight::Int8 { .. });
+    if let Some(head) = &owned.lm_head {
+        elems += head.weight.elements();
+        bytes += head.weight.storage_bytes();
+        max_k = max_k.max(head.in_features);
+        int8 |= matches!(head.weight, PackedWeight::Int8 { .. });
+    }
+    for layer in &owned.layers {
+        for lin in [
+            &layer.q,
+            &layer.k,
+            &layer.v,
+            &layer.o,
+            &layer.gate,
+            &layer.up,
+            &layer.down,
+        ] {
+            elems += lin.weight.elements();
+            bytes += lin.weight.storage_bytes();
+            max_k = max_k.max(lin.in_features);
+            int8 |= matches!(lin.weight, PackedWeight::Int8 { .. });
+        }
+    }
+    (elems, bytes, max_k, int8)
 }
 
 fn apply_linear(
@@ -1003,18 +1090,33 @@ fn apply_linear(
     lin: &DevLinear,
     x: &Act,
     y: &mut Act,
+    dequant: &mut Act,
     rows: usize,
 ) -> Result<(), Error> {
-    gemm_act(
-        dev,
-        dtype,
-        x,
-        &lin.weight,
-        y,
-        rows,
-        lin.out_features,
-        lin.in_features,
-    )?;
+    match &lin.weight {
+        DevWeight::Dense(weight) => gemm_act(
+            dev,
+            dtype,
+            x,
+            weight,
+            y,
+            rows,
+            lin.out_features,
+            lin.in_features,
+        )?,
+        DevWeight::Int8 { q, scales } => gemm_int8(
+            dev,
+            dtype,
+            x,
+            q,
+            scales,
+            Int8Out::Act(y),
+            dequant,
+            rows,
+            lin.out_features,
+            lin.in_features,
+        )?,
+    }
     if let Some(bias) = &lin.bias {
         bias_act(dev, dtype, y, bias, rows, lin.out_features)?;
     }
@@ -1081,23 +1183,246 @@ fn gemm_logits(
     dev: &Device,
     dtype: GpuDType,
     x: &Act,
-    w: &Act,
+    w: &DevWeight,
     y: &mut F32Buf,
+    dequant: &mut Act,
     rows: usize,
     out_features: usize,
     in_features: usize,
 ) -> Result<(), Error> {
+    match w {
+        DevWeight::Dense(weight) => match dtype {
+            GpuDType::F32 => {
+                let (x, w) = pair(x, weight)?;
+                dev.gemm_nt(x, w, y, rows, out_features, in_features)
+                    .map_err(gpu_err)
+            }
+            GpuDType::Bf16 => {
+                let (x, w) = pair_bf16(x, weight)?;
+                dev.gemm_bf16_f32(x, w, y, rows, out_features, in_features)
+                    .map_err(gpu_err)
+            }
+        },
+        DevWeight::Int8 { q, scales } => gemm_int8(
+            dev,
+            dtype,
+            x,
+            q,
+            scales,
+            Int8Out::Logits(y),
+            dequant,
+            rows,
+            out_features,
+            in_features,
+        ),
+    }
+}
+
+enum Int8Out<'a> {
+    Act(&'a mut Act),
+    Logits(&'a mut F32Buf),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_int8(
+    dev: &Device,
+    dtype: GpuDType,
+    x: &Act,
+    q: &I8Buf,
+    scales: &F32Buf,
+    mut y: Int8Out<'_>,
+    dequant: &mut Act,
+    rows: usize,
+    out_features: usize,
+    in_features: usize,
+) -> Result<(), Error> {
+    if rows <= INT8_GEMV_MAX_ROWS {
+        return gemv_int8(dev, dtype, x, q, scales, y, rows, out_features, in_features);
+    }
+    let mut col = 0;
+    while col < out_features {
+        let tile = (out_features - col).min(INT8_DEQUANT_TILE);
+        dequant_tile(dev, dtype, dequant, q, scales, col, tile, in_features)?;
+        gemm_tile(
+            dev,
+            dtype,
+            x,
+            dequant,
+            &mut y,
+            rows,
+            tile,
+            in_features,
+            out_features,
+            col,
+        )?;
+        col += tile;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemv_int8(
+    dev: &Device,
+    dtype: GpuDType,
+    x: &Act,
+    q: &I8Buf,
+    scales: &F32Buf,
+    y: Int8Out<'_>,
+    rows: usize,
+    out_features: usize,
+    in_features: usize,
+) -> Result<(), Error> {
+    match (dtype, y) {
+        (GpuDType::F32, Int8Out::Act(y)) => dev
+            .w8a_gemv_f32(
+                as_f32_mut(y)?,
+                expect_f32(x)?,
+                q,
+                scales,
+                rows,
+                out_features,
+                in_features,
+            )
+            .map_err(gpu_err),
+        (GpuDType::F32, Int8Out::Logits(y)) => dev
+            .w8a_gemv_f32(
+                y,
+                expect_f32(x)?,
+                q,
+                scales,
+                rows,
+                out_features,
+                in_features,
+            )
+            .map_err(gpu_err),
+        (GpuDType::Bf16, Int8Out::Act(y)) => dev
+            .w8a_gemv_bf16(
+                as_bf16_mut(y)?,
+                expect_bf16(x)?,
+                q,
+                scales,
+                rows,
+                out_features,
+                in_features,
+            )
+            .map_err(gpu_err),
+        (GpuDType::Bf16, Int8Out::Logits(y)) => dev
+            .w8a_gemv_bf16_f32(
+                y,
+                expect_bf16(x)?,
+                q,
+                scales,
+                rows,
+                out_features,
+                in_features,
+            )
+            .map_err(gpu_err),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dequant_tile(
+    dev: &Device,
+    dtype: GpuDType,
+    dst: &mut Act,
+    q: &I8Buf,
+    scales: &F32Buf,
+    src_row: usize,
+    rows: usize,
+    cols: usize,
+) -> Result<(), Error> {
     match dtype {
-        GpuDType::F32 => {
-            let (x, w) = pair(x, w)?;
-            dev.gemm_nt(x, w, y, rows, out_features, in_features)
-                .map_err(gpu_err)
-        }
-        GpuDType::Bf16 => {
-            let (x, w) = pair_bf16(x, w)?;
-            dev.gemm_bf16_f32(x, w, y, rows, out_features, in_features)
-                .map_err(gpu_err)
-        }
+        GpuDType::F32 => dev
+            .dequant_i8_f32(as_f32_mut(dst)?, q, scales, src_row, rows, cols)
+            .map_err(gpu_err),
+        GpuDType::Bf16 => dev
+            .dequant_i8_bf16(as_bf16_mut(dst)?, q, scales, src_row, rows, cols)
+            .map_err(gpu_err),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_tile(
+    dev: &Device,
+    dtype: GpuDType,
+    x: &Act,
+    w: &Act,
+    y: &mut Int8Out<'_>,
+    rows: usize,
+    tile_out: usize,
+    in_features: usize,
+    ldc: usize,
+    col: usize,
+) -> Result<(), Error> {
+    match (dtype, y) {
+        (GpuDType::F32, Int8Out::Act(y)) => dev
+            .gemm_nt_strided(
+                expect_f32(x)?,
+                expect_f32(w)?,
+                as_f32_mut(y)?,
+                rows,
+                tile_out,
+                in_features,
+                ldc,
+                col,
+            )
+            .map_err(gpu_err),
+        (GpuDType::F32, Int8Out::Logits(y)) => dev
+            .gemm_nt_strided(
+                expect_f32(x)?,
+                expect_f32(w)?,
+                y,
+                rows,
+                tile_out,
+                in_features,
+                ldc,
+                col,
+            )
+            .map_err(gpu_err),
+        (GpuDType::Bf16, Int8Out::Act(y)) => dev
+            .gemm_bf16_strided(
+                expect_bf16(x)?,
+                expect_bf16(w)?,
+                as_bf16_mut(y)?,
+                rows,
+                tile_out,
+                in_features,
+                ldc,
+                col,
+            )
+            .map_err(gpu_err),
+        (GpuDType::Bf16, Int8Out::Logits(y)) => dev
+            .gemm_bf16_f32_strided(
+                expect_bf16(x)?,
+                expect_bf16(w)?,
+                y,
+                rows,
+                tile_out,
+                in_features,
+                ldc,
+                col,
+            )
+            .map_err(gpu_err),
+    }
+}
+
+fn embed_i8(
+    dev: &Device,
+    dtype: GpuDType,
+    out: &mut Act,
+    table: &I8Buf,
+    scales: &F32Buf,
+    tokens: &I32Buf,
+    rows: usize,
+    hidden: usize,
+) -> Result<(), Error> {
+    match dtype {
+        GpuDType::F32 => dev
+            .embed_i8_f32(as_f32_mut(out)?, table, scales, tokens, rows, hidden)
+            .map_err(gpu_err),
+        GpuDType::Bf16 => dev
+            .embed_i8_bf16(as_bf16_mut(out)?, table, scales, tokens, rows, hidden)
+            .map_err(gpu_err),
     }
 }
 
@@ -1893,5 +2218,107 @@ mod tests {
             .unwrap();
         assert_eq!(argmax(&got), argmax(&full));
         assert_close(&got, &full, 5e-2);
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA GPU"]
+    fn gpu_int8_matches_cpu_int8() {
+        let cfg = tiny();
+        let short = [1_u32, 4, 9, 2, 8, 3];
+        let mut cpu = Model::from_random_with(&cfg, 7, crate::QuantMode::Int8).unwrap();
+        let expect_short = cpu.forward_prompt(&short, 4).unwrap().logits.unwrap();
+        let mut gpu = Model::from_random_with(&cfg, 7, crate::QuantMode::Int8)
+            .unwrap()
+            .into_gpu_with(8, 4, GpuDType::F32)
+            .unwrap();
+        let got_short = gpu.forward_prompt(&short).unwrap().logits.unwrap();
+        assert_eq!(argmax(&got_short), argmax(&expect_short));
+        assert_close(&got_short, &expect_short, 2e-2);
+
+        // Longer than the fused GEMV cutoff, so prefill takes dequant + cuBLAS.
+        let long: Vec<u32> = (0..80).map(|i| (i % 31) + 1).collect();
+        let mut cpu_long = Model::from_random_with(&cfg, 7, crate::QuantMode::Int8).unwrap();
+        let expect_long = cpu_long.forward_prompt(&long, 4).unwrap().logits.unwrap();
+        let mut gpu_long = Model::from_random_with(&cfg, 7, crate::QuantMode::Int8)
+            .unwrap()
+            .into_gpu_with(24, 4, GpuDType::F32)
+            .unwrap();
+        let got_long = gpu_long.forward_prompt(&long).unwrap().logits.unwrap();
+        assert_eq!(argmax(&got_long), argmax(&expect_long));
+        assert_close(&got_long, &expect_long, 2e-2);
+
+        // Second decode replays the CUDA graph captured on the first single-token step.
+        let prompt = [1_u32, 4, 9, 2];
+        let mut cpu_dec = Model::from_random_with(&cfg, 7, crate::QuantMode::Int8).unwrap();
+        let expect_dec = cpu_dec
+            .forward_prompt(&[1, 4, 9, 2, 8, 3], 4)
+            .unwrap()
+            .logits
+            .unwrap();
+        let mut gpu_dec = Model::from_random_with(&cfg, 7, crate::QuantMode::Int8)
+            .unwrap()
+            .into_gpu_with(8, 4, GpuDType::F32)
+            .unwrap();
+        let table = [0_u32, 1];
+        gpu_dec
+            .forward_batch(&[ForwardChunk {
+                tokens: &prompt,
+                position: 0,
+                block_table: &table,
+                want_logits: false,
+            }])
+            .unwrap();
+        let first = [8_u32];
+        gpu_dec
+            .forward_batch(&[ForwardChunk {
+                tokens: &first,
+                position: prompt.len(),
+                block_table: &table,
+                want_logits: true,
+            }])
+            .unwrap();
+        let second = [3_u32];
+        let got_dec = gpu_dec
+            .forward_batch(&[ForwardChunk {
+                tokens: &second,
+                position: prompt.len() + 1,
+                block_table: &table,
+                want_logits: true,
+            }])
+            .unwrap()
+            .pop()
+            .unwrap()
+            .unwrap();
+        assert_eq!(argmax(&got_dec), argmax(&expect_dec));
+        assert_close(&got_dec, &expect_dec, 2e-2);
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA GPU"]
+    fn gpu_int8_logits_close_to_bf16() {
+        let cfg = tiny();
+        let tokens = [1_u32, 4, 9, 2, 8, 3];
+        let mut bf16 = Model::from_random(&cfg, 7)
+            .unwrap()
+            .into_gpu_with(8, 4, GpuDType::Bf16)
+            .unwrap();
+        let expect = bf16.forward_prompt(&tokens).unwrap().logits.unwrap();
+        let mut int8 = Model::from_random_with(&cfg, 7, crate::QuantMode::Int8)
+            .unwrap()
+            .into_gpu_with(8, 4, GpuDType::Bf16)
+            .unwrap();
+        let got = int8.forward_prompt(&tokens).unwrap().logits.unwrap();
+        assert_eq!(argmax(&got), argmax(&expect));
+        let mut dot = 0.0_f32;
+        let mut na = 0.0_f32;
+        let mut nb = 0.0_f32;
+        for (x, y) in got.iter().zip(&expect) {
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        let sim = dot / (na.sqrt() * nb.sqrt());
+        assert!(sim > 0.98, "cosine {sim}");
+        assert_close(&got, &expect, 0.25);
     }
 }

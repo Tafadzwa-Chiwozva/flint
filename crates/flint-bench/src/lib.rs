@@ -53,6 +53,11 @@ pub struct BenchConfig {
     pub timeout: Duration,
     /// Route to call.
     pub endpoint: Endpoint,
+    /// Weight quantization the server was started with.
+    ///
+    /// The client does not quantize. The label is stored on the report so a
+    /// bench of `--quant none` and `--quant int8` stays distinguishable.
+    pub quant: String,
 }
 
 /// One finished request.
@@ -106,6 +111,8 @@ pub struct Report {
     pub itl_ms: Option<Percentiles>,
     /// End to end latency.
     pub e2e_ms: Percentiles,
+    /// Quantization label from [`BenchConfig::quant`].
+    pub quant: String,
     /// Per-request samples, in completion order.
     pub samples: Vec<RequestSample>,
 }
@@ -241,6 +248,7 @@ pub async fn run(config: &BenchConfig) -> anyhow::Result<Report> {
         ttft_ms: summarize(&ttft).context("no TTFT samples")?,
         itl_ms: summarize(&itl),
         e2e_ms: summarize(&e2e).context("no end-to-end samples")?,
+        quant: config.quant.clone(),
         samples,
     })
 }
@@ -431,6 +439,7 @@ mod tests {
                 min: 2.0,
                 max: 2.0,
             },
+            quant: "none".into(),
             samples: Vec::new(),
         };
         let csv = report_csv(&report);
