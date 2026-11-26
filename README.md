@@ -198,27 +198,32 @@ Inter-token latency is the gap between SSE events that carry text. At concurrenc
 - The engine executes a scheduled batch one sequence at a time. There is no cross-sequence fused GEMM on CPU.
 - Preemption recomputes. It does not swap KV to a side buffer.
 - Block refcounts and copy-on-write are ready for prefix sharing. The scheduler does not use them yet.
-- Weights are widened to f32. There is no on-the-fly bf16 GEMM, and no 4-bit or 8-bit matmul.
+- The CPU path widens weights to f32. There is no 4-bit or 8-bit matmul. CUDA can keep weights and activations in bf16 (see Phase 2).
 - `--device cuda` (see Phase 2) is off unless the binary is built with `--features cuda`. The default build and the default CI job stay CPU-only.
 - No speculative decoding, no repetition penalty, no tool calls. `n` other than 1 is rejected; concurrency is multiple HTTP requests.
 - Detokenization decodes the full generated prefix each step. Stop-string filtering then decides how much of the new suffix is safe to emit.
 
 ## Phase 2 — CUDA forward path
 
-`--device cpu` stays the default and does not change the phase-1 math. `--device cuda` uploads the f32 weights once, keeps K and V in a device buffer with the same block layout as the host cache, and runs each scheduler step as one batched forward.
+`--device cpu` stays the default and does not change the phase-1 math. `--device cuda` uploads the weights once, keeps K and V in a device buffer with the same block layout as the host cache, and runs each scheduler step as one batched forward.
+
+`--dtype auto` (the default) is f32 on CPU and bf16 on CUDA. `--dtype f32` forces the pedantic parity path on CUDA. `--dtype bf16` is rejected on CPU. bf16 mode stores weights, activations, and KV as bf16 and accumulates GEMMs in f32 on tensor cores (`cublasGemmEx` with `CUBLAS_COMPUTE_32F`). Logits stay f32. The f32 mode keeps `CUBLAS_PEDANTIC_MATH` so Ampere/Ada TF32 does not change the comparison against the CPU oracle.
 
 ```text
 tokens in the step are concatenated into one row batch
 for each layer:
-  RMSNorm, then cuBLAS GEMMs for Q, K, V
+  fused residual copy + RMSNorm, then Q, K, V GEMMs
   RoPE on Q and K, write K and V through the block tables
-  single-token rows: one paged-decode launch (one warp per query head)
+  single-token rows: one paged-decode launch (one warp per query head;
+    bf16 uses vector loads, and split-K once the context is long)
   multi-token rows: one causal prefill launch per sequence
-  output GEMM, residual add, RMSNorm, SwiGLU, down GEMM, residual add
+  output GEMM, fused residual add + RMSNorm, SwiGLU, down GEMM, residual add
 logits: final RMSNorm and the LM head, only for sequences that sample
 ```
 
-cuBLAS runs in pedantic f32 (`CUBLAS_PEDANTIC_MATH`) so Ampere/Ada TF32 does not change the comparison against the CPU oracle. The kernels live in `kernels/ops.cu`. `build.rs` compiles them to PTX with `nvcc -ptx` when `--features cuda` is on, and `cudarc` loads that PTX with the driver API at runtime. Compiling the feature needs `nvcc`. Running it needs a GPU, `libcuda`, and `libcublas`. A machine without the toolkit never builds this path: the feature is off by default, and `build.rs` is a no-op then.
+Block tables, positions, and token ids stay in device buffers and are overwritten in place when they fit, so a decode step does not allocate them again. A pure decode whose batch size is 1, 2, 4, 8, 16, 32, or 64 is captured as a CUDA graph after the first eager step of that size and replayed after that. Other shapes, and a capture that the driver rejects, stay eager.
+
+The kernels live in `kernels/ops.cu`. `build.rs` compiles them to PTX with `nvcc -ptx` when `--features cuda` is on, and `cudarc` loads that PTX with the driver API at runtime. Compiling the feature needs `nvcc`. Running it needs a GPU, `libcuda`, and `libcublas`. A machine without the toolkit never builds this path: the feature is off by default, and `build.rs` is a no-op then.
 
 Ignored tests compare the kernels and the full tiny-model logits to the CPU reference. They do not run in CI:
 
@@ -233,11 +238,12 @@ On a fresh RunPod RTX 4090 (driver installed, repo checked out):
 bash scripts/gpu_smoke.sh
 ```
 
-The script installs build tools, Rust 1.100, and `nvcc` if they are missing, runs the ignored GPU tests, serves `Qwen/Qwen2.5-0.5B-Instruct` with `--device cuda`, and prints tok/s and TTFT at concurrency 1, 8, and 32. Point it at a local snapshot with `FLINT_MODEL_DIR`. Serve the same way by hand:
+The script installs build tools, Rust 1.100, and `nvcc` if they are missing, downloads the model (curl follows the relative Hugging Face redirect), exports `FLINT_MODEL_DIR`, and runs the ignored GPU tests whose inputs are present. The Hugging Face logit file is skipped unless `FLINT_HF_LOGITS` is set. It then serves `Qwen/Qwen2.5-0.5B-Instruct` with `--device cuda --dtype bf16` and writes `bench-results/gpu-c{1,8,32}.json`. The exit trap prints a table of test status plus tok/s, TTFT p50/p99, and inter-token latency at concurrency 1, 8, and 32. Serve the same way by hand:
 
 ```bash
 cargo build --release -p flint-server --features cuda
-./target/release/flint serve --device cuda --model-dir models/Qwen2.5-0.5B-Instruct \
+./target/release/flint serve --device cuda --dtype bf16 \
+  --model-dir models/Qwen--Qwen2.5-0.5B-Instruct \
   --max-num-seqs 32 --num-blocks 512
 ```
 

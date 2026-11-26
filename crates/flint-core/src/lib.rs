@@ -25,6 +25,8 @@ mod weights;
 pub use config::{EosTokenId, ModelConfig};
 pub use error::Error;
 #[cfg(feature = "cuda")]
+pub use flint_kernels::cuda::GpuDType;
+#[cfg(feature = "cuda")]
 pub use gpu::GpuModel;
 pub use model::{ForwardChunk, ForwardOutput, Model};
 pub use sampling::{sample, SamplingParams};

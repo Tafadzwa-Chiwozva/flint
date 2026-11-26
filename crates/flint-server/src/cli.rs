@@ -10,7 +10,9 @@ use flint_core::{
 };
 use hf_hub::api::sync::Api;
 
-use crate::engine::{into_engine_model, spawn, EngineEvent, ExecDevice, FinishReason, TextCodec};
+use crate::engine::{
+    into_engine_model, spawn, EngineEvent, ExecDType, ExecDevice, FinishReason, TextCodec,
+};
 use crate::http::{router, AppState};
 use crate::serve_runtime;
 
@@ -30,6 +32,28 @@ impl DeviceKind {
             Self::Cpu => ExecDevice::Cpu,
             Self::Cuda => ExecDevice::Cuda,
         }
+    }
+}
+
+/// Weight storage. `auto` is f32 on CPU and bf16 on CUDA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum DTypeKind {
+    /// f32 on CPU, bf16 on CUDA.
+    Auto,
+    /// Full precision, including the CUDA parity path.
+    F32,
+    /// bf16 storage with f32 accumulation. CUDA only.
+    Bf16,
+}
+
+fn resolve_dtype(device: DeviceKind, dtype: DTypeKind) -> anyhow::Result<ExecDType> {
+    match (device, dtype) {
+        (DeviceKind::Cpu, DTypeKind::Bf16) => {
+            anyhow::bail!("--dtype bf16 requires --device cuda")
+        }
+        (DeviceKind::Cpu, DTypeKind::Auto | DTypeKind::F32) => Ok(ExecDType::F32),
+        (DeviceKind::Cuda, DTypeKind::F32) => Ok(ExecDType::F32),
+        (DeviceKind::Cuda, DTypeKind::Auto | DTypeKind::Bf16) => Ok(ExecDType::Bf16),
     }
 }
 
@@ -106,6 +130,9 @@ struct ModelArgs {
     /// Execution device. `cpu` is the default.
     #[arg(long, value_enum, default_value = "cpu")]
     device: DeviceKind,
+    /// Weight storage. `auto` is f32 on CPU and bf16 on CUDA.
+    #[arg(long, value_enum, default_value = "auto")]
+    dtype: DTypeKind,
 }
 
 #[derive(Parser)]
@@ -211,10 +238,17 @@ pub async fn cli() -> anyhow::Result<()> {
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     require_device(args.model.device)?;
+    let dtype = resolve_dtype(args.model.device, args.model.dtype)?;
     let (model, codec, model_name) = load_pair(&args.model)?;
     let num_blocks = args.num_blocks;
     let block_size = args.block_size;
-    let model = into_engine_model(model, args.model.device.exec(), num_blocks, block_size)?;
+    let model = into_engine_model(
+        model,
+        args.model.device.exec(),
+        dtype,
+        num_blocks,
+        block_size,
+    )?;
     tracing::info!(device = ?args.model.device, "forward device");
     let (engine, thread) = spawn(
         model,
@@ -253,10 +287,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
 async fn generate(args: GenerateArgs) -> anyhow::Result<()> {
     require_device(args.model.device)?;
+    let dtype = resolve_dtype(args.model.device, args.model.dtype)?;
     let (model, codec, _) = load_pair(&args.model)?;
     let model = into_engine_model(
         model,
         args.model.device.exec(),
+        dtype,
         args.num_blocks,
         args.block_size,
     )?;
@@ -342,6 +378,7 @@ fn logits(args: LogitsArgs) -> anyhow::Result<()> {
         anyhow::bail!("--dummy has no checkpoint to score; use generate");
     }
     require_device(args.model.device)?;
+    resolve_dtype(args.model.device, args.model.dtype)?;
     let dir = resolve_dir(&args.model)?;
     let model = Model::load(&dir)?;
     let tokenizer = FlintTokenizer::open(&dir)?;
@@ -431,7 +468,11 @@ fn score_cuda(
 ) -> anyhow::Result<Vec<ScoredPrompt>> {
     let max_len = encoded.iter().map(|(_, ids)| ids.len()).max().unwrap_or(1);
     let n_blocks = max_len.div_ceil(args.block_size).max(1);
-    let mut gpu = model.into_gpu(n_blocks, args.block_size)?;
+    let dtype = match resolve_dtype(args.model.device, args.model.dtype)? {
+        ExecDType::F32 => flint_core::GpuDType::F32,
+        ExecDType::Bf16 => flint_core::GpuDType::Bf16,
+    };
+    let mut gpu = model.into_gpu_with(n_blocks, args.block_size, dtype)?;
     let mut rows = Vec::new();
     for (prompt, token_ids) in encoded {
         let output = gpu.forward_prompt(token_ids)?;
