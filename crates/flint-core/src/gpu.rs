@@ -13,7 +13,8 @@
 use std::collections::HashMap;
 
 use flint_kernels::cuda::{
-    AttnShape, Bf16Buf, CapturedGraph, Device, F32Buf, GpuDType, I32Buf, I8Buf, MAX_HEAD_DIM,
+    w8a_plan, AttnShape, Bf16Buf, CapturedGraph, Device, F32Buf, GpuDType, I32Buf, I8Buf,
+    MAX_HEAD_DIM, W8A_ROW_TILE,
 };
 use flint_kernels::CacheGeometry;
 
@@ -22,9 +23,16 @@ use crate::error::Error;
 use crate::model::{ForwardChunk, ForwardOutput};
 use crate::quant::PackedWeight;
 
-/// Rows at or below this use the fused dequant GEMV, including every CUDA-graph
-/// decode width. Larger prefill rows dequantize into scratch and call cuBLAS.
-const INT8_GEMV_MAX_ROWS: usize = 64;
+/// Rows at or below this use the fused dequant GEMV. It reloads each int8 row
+/// for every four batch rows, which is the fast path for c=1 and c=8 decode.
+const INT8_GEMV_MAX_ROWS: usize = W8A_ROW_TILE;
+
+/// Rows above [`INT8_GEMV_MAX_ROWS`] and at or below this use the
+/// weight-stationary GEMM. That covers captured decode widths 16, 32, and 64
+/// and the ~160-row prefill that arrives with concurrency 32. Wider prefills
+/// dequantize into scratch and call cuBLAS, where tensor cores win once the
+/// activation tile would be reloaded across a huge output dimension.
+const INT8_W8A_MAX_ROWS: usize = 512;
 
 /// Host weights moved out of [`crate::Model`] before the upload.
 pub(crate) struct OwnedLinear {
@@ -118,8 +126,8 @@ struct Scratch {
     gathered: Act,
     /// Logits stay f32 in both modes so the sampler reads full precision.
     logits: F32Buf,
-    /// Dequantized copy of one INT8 matrix for prefill GEMMs. Decode uses the
-    /// fused GEMV and does not read this buffer.
+    /// Dequantized copy of one INT8 matrix. The GEMV and the weight-stationary
+    /// GEMM do not read it. Prefills wider than [`INT8_W8A_MAX_ROWS`] do.
     dequant: Act,
     /// Split-K workspace. Unused when `splits == 1`.
     partial_acc: F32Buf,
@@ -242,6 +250,19 @@ pub struct GpuModel {
     scale: f32,
 }
 
+impl Drop for GpuModel {
+    fn drop(&mut self) {
+        // Field order drops `dev` (module unload, then `cublasDestroy`) before
+        // `graphs`. cudarc destroys a graph without binding the context, so
+        // that order faults once two models — draft then target — are torn
+        // down on the engine thread. Sync first so the context is current,
+        // then drop the graphs while the module and the cuBLAS handle still
+        // exist.
+        let _ = self.dev.synchronize();
+        self.graphs.clear();
+    }
+}
+
 impl GpuModel {
     pub(crate) fn from_owned(
         owned: OwnedWeights,
@@ -300,10 +321,10 @@ impl GpuModel {
         }
         let mut scratch = Scratch::empty(dtype);
         if quant_i8 {
-            // One copy of the largest INT8 matrix. Prefill then dequantizes that
-            // matrix once and issues one cuBLAS GEMM. A 2048-wide tile turned
-            // the 0.5B LM head into 75 sequential GEMMs. Decode never reads
-            // this buffer, so its size does not change a captured graph.
+            // One copy of the largest INT8 matrix, for the cuBLAS fallback.
+            // A 2048-wide tile turned the 0.5B LM head into 75 sequential
+            // GEMMs. Decode and moderate prefills never read this buffer, so
+            // its size does not change a captured graph.
             scratch.dequant = alloc_act(&dev, dtype, max_matrix.max(1))?;
         }
         tracing::info!(
@@ -1085,8 +1106,8 @@ fn grow(dev: &Device, buf: &mut Act, n: usize) -> Result<(), Error> {
     }
 }
 
-/// Batch sizes recorded as CUDA graphs. Every one of these is at or below
-/// [`INT8_GEMV_MAX_ROWS`], so a captured INT8 decode never calls cuBLAS.
+/// Batch sizes recorded as CUDA graphs. INT8 widths above [`INT8_GEMV_MAX_ROWS`]
+/// stay on the weight-stationary GEMM, so a captured decode never calls cuBLAS.
 fn is_captured_decode_batch(rows: usize) -> bool {
     matches!(rows, 1 | 2 | 4 | 8 | 16 | 32 | 64)
 }
@@ -1331,6 +1352,9 @@ fn gemm_int8(
     if rows <= INT8_GEMV_MAX_ROWS {
         return gemv_int8(dev, dtype, x, q, scales, y, rows, out_features, in_features);
     }
+    if rows <= INT8_W8A_MAX_ROWS && w8a_plan(in_features).is_some() {
+        return gemm_w8a(dev, dtype, x, q, scales, y, rows, out_features, in_features);
+    }
     // One span when scratch holds the matrix. A short scratch still tiles, so
     // a smaller allocation cannot write past the buffer.
     let tiles = crate::quant::dequant_tiles(out_features, in_features, dequant.capacity());
@@ -1407,6 +1431,66 @@ fn gemv_int8(
             .map_err(gpu_err),
         (GpuDType::Bf16, Int8Out::Logits(y)) => dev
             .w8a_gemv_bf16_f32(
+                y,
+                expect_bf16(x)?,
+                q,
+                scales,
+                rows,
+                out_features,
+                in_features,
+            )
+            .map_err(gpu_err),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_w8a(
+    dev: &Device,
+    dtype: GpuDType,
+    x: &Act,
+    q: &I8Buf,
+    scales: &F32Buf,
+    y: Int8Out<'_>,
+    rows: usize,
+    out_features: usize,
+    in_features: usize,
+) -> Result<(), Error> {
+    match (dtype, y) {
+        (GpuDType::F32, Int8Out::Act(y)) => dev
+            .w8a_gemm_f32(
+                as_f32_mut(y)?,
+                expect_f32(x)?,
+                q,
+                scales,
+                rows,
+                out_features,
+                in_features,
+            )
+            .map_err(gpu_err),
+        (GpuDType::F32, Int8Out::Logits(y)) => dev
+            .w8a_gemm_f32(
+                y,
+                expect_f32(x)?,
+                q,
+                scales,
+                rows,
+                out_features,
+                in_features,
+            )
+            .map_err(gpu_err),
+        (GpuDType::Bf16, Int8Out::Act(y)) => dev
+            .w8a_gemm_bf16(
+                as_bf16_mut(y)?,
+                expect_bf16(x)?,
+                q,
+                scales,
+                rows,
+                out_features,
+                in_features,
+            )
+            .map_err(gpu_err),
+        (GpuDType::Bf16, Int8Out::Logits(y)) => dev
+            .w8a_gemm_bf16_f32(
                 y,
                 expect_bf16(x)?,
                 q,
@@ -2336,7 +2420,7 @@ mod tests {
         assert_eq!(argmax(&got_short), argmax(&expect_short));
         assert_close(&got_short, &expect_short, 2e-2);
 
-        // Longer than the fused GEMV cutoff, so prefill takes dequant + cuBLAS.
+        // Longer than the GEMV cutoff, so prefill takes the weight-stationary GEMM.
         let long: Vec<u32> = (0..80).map(|i| (i % 31) + 1).collect();
         let mut cpu_long = Model::from_random_with(&cfg, 7, crate::QuantMode::Int8).unwrap();
         let expect_long = cpu_long.forward_prompt(&long, 4).unwrap().logits.unwrap();
@@ -2472,19 +2556,102 @@ mod tests {
         assert_close(&got, &expect, 0.25);
     }
 
-    #[test]
-    fn captured_decode_widths_stay_on_the_int8_gemv() {
-        let mut saw_graph_width = false;
-        for rows in 0..=128 {
-            if is_captured_decode_batch(rows) {
-                saw_graph_width = true;
-                assert!(
-                    rows <= INT8_GEMV_MAX_ROWS,
-                    "graph width {rows} would enter the cuBLAS dequant path"
-                );
-            }
+    fn int8_matmul_path(rows: usize, k: usize) -> &'static str {
+        if rows <= INT8_GEMV_MAX_ROWS {
+            "gemv"
+        } else if rows <= INT8_W8A_MAX_ROWS && w8a_plan(k).is_some() {
+            "w8a"
+        } else {
+            "cublas"
         }
-        assert!(saw_graph_width);
+    }
+
+    #[test]
+    fn int8_c32_decode_and_prefill_stay_off_cublas() {
+        let hidden = 896;
+        let down = 4864;
+        for rows in [1, 2, 4, 8] {
+            assert_eq!(int8_matmul_path(rows, hidden), "gemv", "rows {rows}");
+            assert_eq!(int8_matmul_path(rows, down), "gemv", "down rows {rows}");
+        }
+        // c=32 decode, the ~160-row arrival prefill, and captured widths 16/32/64.
+        for rows in [16, 32, 64, 160, 192, 512] {
+            assert_eq!(int8_matmul_path(rows, hidden), "w8a", "rows {rows}");
+            assert_eq!(int8_matmul_path(rows, down), "w8a", "down rows {rows}");
+        }
+        for rows in [1, 2, 4, 8, 16, 32, 64] {
+            assert!(
+                is_captured_decode_batch(rows),
+                "missing captured width {rows}"
+            );
+            assert_ne!(
+                int8_matmul_path(rows, hidden),
+                "cublas",
+                "graph width {rows} would capture cuBLAS"
+            );
+        }
+        assert_eq!(int8_matmul_path(513, hidden), "cublas");
+        assert!(w8a_plan(0).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA GPU"]
+    fn two_gpu_models_drop_captured_graphs() {
+        let cfg = tiny();
+        let prompt = [1_u32, 4, 9, 2];
+        let table = [0_u32, 1];
+        let mut target = Model::from_random(&cfg, 5)
+            .unwrap()
+            .into_gpu_with(8, 4, GpuDType::Bf16)
+            .unwrap();
+        let mut draft = Model::from_random_with(&cfg, 9, crate::QuantMode::Int8)
+            .unwrap()
+            .into_gpu_with(8, 4, GpuDType::Bf16)
+            .unwrap();
+        for model in [&mut target, &mut draft] {
+            model
+                .forward_batch(&[ForwardChunk {
+                    tokens: &prompt,
+                    position: 0,
+                    block_table: &table,
+                    want_logits: false,
+                }])
+                .unwrap();
+            model
+                .forward_batch(&[ForwardChunk {
+                    tokens: &[8_u32],
+                    position: prompt.len(),
+                    block_table: &table,
+                    want_logits: true,
+                }])
+                .unwrap();
+            assert_graph_captured(model);
+        }
+        // engine_loop drops the draft parameter before the target.
+        drop(draft);
+        drop(target);
+
+        let mut target = Model::from_random(&cfg, 3)
+            .unwrap()
+            .into_gpu_with(8, 4, GpuDType::Bf16)
+            .unwrap();
+        let mut draft = Model::from_random_with(&cfg, 4, crate::QuantMode::Int8)
+            .unwrap()
+            .into_gpu_with(8, 4, GpuDType::Bf16)
+            .unwrap();
+        for model in [&mut draft, &mut target] {
+            model
+                .forward_batch(&[ForwardChunk {
+                    tokens: &[8_u32],
+                    position: 0,
+                    block_table: &table,
+                    want_logits: true,
+                }])
+                .unwrap();
+            assert_graph_captured(model);
+        }
+        drop(target);
+        drop(draft);
     }
 
     fn assert_graph_captured(model: &GpuModel) {

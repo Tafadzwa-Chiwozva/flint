@@ -12,8 +12,8 @@ use flint_core::{
 use hf_hub::api::sync::Api;
 
 use crate::engine::{
-    into_engine_model, spawn, DraftSpec, EngineEvent, ExecDType, ExecDevice, FinishReason,
-    LanguageModel, TextCodec,
+    into_engine_model, shutdown, spawn, DraftSpec, EngineEvent, ExecDType, ExecDevice,
+    FinishReason, LanguageModel, TextCodec,
 };
 use crate::http::{router, AppState};
 use crate::serve_runtime;
@@ -337,7 +337,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .with_graceful_shutdown(serve_runtime::shutdown_signal())
         .await
         .context("http server")?;
-    drop(thread);
+    // The router owns the engine sender and drops it before `serve` returns.
+    // Join so CUDA teardown finishes on the engine thread before process exit.
+    thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("engine thread panicked"))?;
     Ok(())
 }
 
@@ -372,7 +376,7 @@ async fn generate(args: GenerateArgs) -> anyhow::Result<()> {
         seed: args.seed,
     };
     sampling.validate()?;
-    let (engine, _thread) = spawn(
+    let (engine, thread) = spawn(
         model,
         draft,
         Arc::clone(&codec),
@@ -451,6 +455,7 @@ async fn generate(args: GenerateArgs) -> anyhow::Result<()> {
             );
         }
     }
+    shutdown(engine, thread)?;
     Ok(())
 }
 
