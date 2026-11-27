@@ -1,8 +1,14 @@
-// INT8 weight-only GEMV and the prefill dequant used before cuBLAS.
+// INT8 weight-only matmul and the prefill dequant used before cuBLAS.
 //
 // Weights are row-major `[out, in]` int8 with one f32 scale per output row.
 // The product is scale * sum(activation * q), accumulated in f32. Included by
-// ops.cu so load_float, store_one, and block_sum stay shared.
+// ops.cu so load_float, store_one, block_sum, and warp_sum stay shared.
+//
+// The GEMV reloads each int8 row for every group of four batch rows. That is
+// fine for a decode of 8 or fewer. Wider batches use the weight-stationary
+// GEMM below: one warp per output column. When the int8 rows fit, the block
+// stages them once and reuses an 8-row activation tile. `w8a_plan` in cuda.rs
+// sizes that shared memory.
 
 template <typename In>
 __device__ void accum_i8x4(
@@ -174,4 +180,170 @@ extern "C" __global__ void flint_embed_i8_f32(
 extern "C" __global__ void flint_embed_i8_bf16(
     __nv_bfloat16* out, const int8_t* table, const float* scales, const int* tokens, int rows, int hidden) {
     flint_embed_i8<__nv_bfloat16>(out, table, scales, tokens, rows, hidden);
+}
+
+// Dot one weight-tile against the staged activation rows. `rows_here == 8` is
+// the steady path (decode 32 and the c=32 arrival prefill are multiples of 8).
+template <int Rows>
+__device__ void accum_wtile(
+    float acc[8],
+    const float* __restrict__ xs,
+    int bk,
+    int rows_here,
+    const int8_t* __restrict__ src,
+    int bk_here,
+    int lane) {
+    const bool vec = (bk_here & 3) == 0 && (reinterpret_cast<uintptr_t>(src) & 3u) == 0;
+    if (vec) {
+        const int groups = bk_here >> 2;
+        for (int t = lane; t < groups; t += 32) {
+            const int base = t << 2;
+            const int packed = *reinterpret_cast<const int*>(src + base);
+            const float w0 = static_cast<float>(static_cast<int8_t>(packed & 0xff));
+            const float w1 = static_cast<float>(static_cast<int8_t>((packed >> 8) & 0xff));
+            const float w2 = static_cast<float>(static_cast<int8_t>((packed >> 16) & 0xff));
+            const float w3 = static_cast<float>(static_cast<int8_t>((packed >> 24) & 0xff));
+            if (rows_here == 8) {
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    const float* row = xs + r * bk + base;
+                    acc[r] += row[0] * w0 + row[1] * w1 + row[2] * w2 + row[3] * w3;
+                }
+            } else {
+                for (int r = 0; r < rows_here && r < Rows; ++r) {
+                    const float* row = xs + r * bk + base;
+                    acc[r] += row[0] * w0 + row[1] * w1 + row[2] * w2 + row[3] * w3;
+                }
+            }
+        }
+        return;
+    }
+    for (int t = lane; t < bk_here; t += 32) {
+        const float w = static_cast<float>(src[t]);
+        if (rows_here == 8) {
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                acc[r] += xs[r * bk + t] * w;
+            }
+        } else {
+            for (int r = 0; r < rows_here && r < Rows; ++r) {
+                acc[r] += xs[r * bk + t] * w;
+            }
+        }
+    }
+}
+
+// One warp per output column. When `wbytes` is non-zero the block stages every
+// warp's int8 row once, then an 8-row activation tile (`bk` columns) in the
+// rest of dynamic shared memory. A zero `wbytes` means the row did not fit, so
+// each row tile re-reads the int8 row. Launch with block (32, warps) and grid
+// ceil(n / warps). Captured decode widths above the GEMV cutoff come through
+// here and never call cuBLAS.
+template <typename In, typename Out>
+__device__ void flint_w8a_gemm(
+    Out* __restrict__ y,
+    const In* __restrict__ x,
+    const int8_t* __restrict__ q,
+    const float* __restrict__ scales,
+    int m,
+    int n,
+    int k,
+    int bk,
+    int wbytes,
+    char* __restrict__ smem) {
+    if (m <= 0 || n <= 0 || k <= 0 || bk <= 0) {
+        return;
+    }
+    int8_t* wsmem = reinterpret_cast<int8_t*>(smem);
+    float* xs = reinterpret_cast<float*>(smem + wbytes);
+    const int lane = static_cast<int>(threadIdx.x);
+    const int warp = static_cast<int>(threadIdx.y);
+    const int warps = static_cast<int>(blockDim.y);
+    const int col = static_cast<int>(blockIdx.x) * warps + warp;
+    const bool active = col < n;
+    const float scale = active ? scales[col] : 0.f;
+    const int8_t* wrow = active ? q + static_cast<long long>(col) * k : nullptr;
+    const int tid = warp * static_cast<int>(blockDim.x) + lane;
+    const int threads = static_cast<int>(blockDim.x) * warps;
+
+    if (wbytes > 0) {
+        if (active) {
+            int8_t* dst = wsmem + static_cast<long long>(warp) * k;
+            for (int t = lane; t < k; t += 32) {
+                dst[t] = wrow[t];
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int row0 = 0; row0 < m; row0 += 8) {
+        const int rows_here = (m - row0) < 8 ? (m - row0) : 8;
+        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        for (int k0 = 0; k0 < k; k0 += bk) {
+            const int bk_here = (k - k0) < bk ? (k - k0) : bk;
+            for (int r = 0; r < rows_here; ++r) {
+                const In* row = x + (static_cast<long long>(row0 + r) * k) + k0;
+                for (int c = tid; c < bk_here; c += threads) {
+                    xs[r * bk + c] = load_float(row[c]);
+                }
+            }
+            __syncthreads();
+            if (active) {
+                const int8_t* src = wbytes > 0 ? wsmem + static_cast<long long>(warp) * k + k0
+                                                : wrow + k0;
+                accum_wtile<8>(acc, xs, bk, rows_here, src, bk_here, lane);
+            }
+            __syncthreads();
+        }
+        if (active) {
+            for (int r = 0; r < rows_here; ++r) {
+                const float sum = warp_sum(acc[r]) * scale;
+                if (lane == 0) {
+                    store_one(y + static_cast<long long>(row0 + r) * n + col, sum);
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void flint_w8a_gemm_f32(
+    float* y,
+    const float* x,
+    const int8_t* q,
+    const float* scales,
+    int m,
+    int n,
+    int k,
+    int bk,
+    int wbytes) {
+    extern __shared__ __align__(16) char flint_w8a_smem[];
+    flint_w8a_gemm<float, float>(y, x, q, scales, m, n, k, bk, wbytes, flint_w8a_smem);
+}
+
+extern "C" __global__ void flint_w8a_gemm_bf16(
+    __nv_bfloat16* y,
+    const __nv_bfloat16* x,
+    const int8_t* q,
+    const float* scales,
+    int m,
+    int n,
+    int k,
+    int bk,
+    int wbytes) {
+    extern __shared__ __align__(16) char flint_w8a_smem[];
+    flint_w8a_gemm<__nv_bfloat16, __nv_bfloat16>(y, x, q, scales, m, n, k, bk, wbytes, flint_w8a_smem);
+}
+
+extern "C" __global__ void flint_w8a_gemm_bf16_f32(
+    float* y,
+    const __nv_bfloat16* x,
+    const int8_t* q,
+    const float* scales,
+    int m,
+    int n,
+    int k,
+    int bk,
+    int wbytes) {
+    extern __shared__ __align__(16) char flint_w8a_smem[];
+    flint_w8a_gemm<__nv_bfloat16, float>(y, x, q, scales, m, n, k, bk, wbytes, flint_w8a_smem);
 }

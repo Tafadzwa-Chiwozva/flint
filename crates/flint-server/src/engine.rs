@@ -513,6 +513,19 @@ pub(crate) fn spawn(
     Ok((EngineHandle { tx }, handle))
 }
 
+/// Drop the command sender and wait until the engine thread has returned.
+///
+/// The target and the draft, when one is installed, are dropped on that
+/// thread before this returns. `flint generate` has to join: detaching the
+/// thread and returning from `main` tears CUDA down against the driver's
+/// exit handler, which faults when two models still hold graphs.
+pub(crate) fn shutdown(engine: EngineHandle, thread: JoinHandle<()>) -> Result<(), Error> {
+    drop(engine);
+    thread
+        .join()
+        .map_err(|_| Error::Inference("engine thread panicked".into()))
+}
+
 impl EngineHandle {
     pub(crate) fn submit(
         &self,
@@ -1774,6 +1787,78 @@ mod tests {
         drop(_second);
         drop(engine);
         thread.join().unwrap();
+    }
+
+    struct OrderWatch {
+        order: Arc<Mutex<Vec<&'static str>>>,
+        label: &'static str,
+        eos: Vec<u32>,
+    }
+
+    impl Drop for OrderWatch {
+        fn drop(&mut self) {
+            self.order.lock().expect("order").push(self.label);
+        }
+    }
+
+    impl LanguageModel for OrderWatch {
+        fn forward_chunk(
+            &mut self,
+            _tokens: &[u32],
+            _position: usize,
+            _cache: &mut PagedKvCache,
+            _block_table: &[u32],
+            want_logits: bool,
+        ) -> Result<Option<Vec<f32>>, Error> {
+            Ok(want_logits.then(|| vec![0.0; 8]))
+        }
+
+        fn vocab_size(&self) -> usize {
+            8
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn num_kv_heads(&self) -> usize {
+            1
+        }
+
+        fn head_dim(&self) -> usize {
+            4
+        }
+
+        fn eos_token_ids(&self) -> &[u32] {
+            &self.eos
+        }
+    }
+
+    #[test]
+    fn shutdown_drops_draft_before_target_on_the_engine_thread() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (engine, thread) = spawn(
+            Box::new(OrderWatch {
+                order: Arc::clone(&order),
+                label: "target",
+                eos: Vec::new(),
+            }),
+            Some(DraftSpec {
+                model: Box::new(OrderWatch {
+                    order: Arc::clone(&order),
+                    label: "draft",
+                    eos: Vec::new(),
+                }),
+                k: 1,
+            }),
+            Arc::new(IdCodec),
+            4,
+            4,
+            sched(),
+        )
+        .unwrap();
+        shutdown(engine, thread).unwrap();
+        assert_eq!(order.lock().expect("order").as_slice(), ["draft", "target"]);
     }
 
     fn tiny(layers: usize, hidden: usize, vocab: usize) -> flint_core::ModelConfig {

@@ -33,6 +33,77 @@ const CUBLAS_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
 /// Largest head dimension the attention kernel keeps in registers.
 pub const MAX_HEAD_DIM: usize = 256;
 
+/// Activation rows staged by one iteration of the weight-stationary INT8 GEMM.
+///
+/// The kernel and [`w8a_plan`] both use this tile. Batches at or below it stay
+/// on the fused GEMV.
+pub const W8A_ROW_TILE: usize = 8;
+
+/// Dynamic shared memory the weight-stationary GEMM will ask for.
+const W8A_SMEM_LIMIT: usize = 48 * 1024;
+
+/// Warps per block. Each warp owns one output column.
+const W8A_WARPS: u32 = 8;
+
+/// Launch geometry for one K of the weight-stationary INT8 GEMM.
+///
+/// The block gives each warp one output column. When the int8 rows fit, they
+/// are staged once at the front of dynamic shared memory and an 8-row
+/// activation tile uses what remains. Otherwise the activation tile takes the
+/// whole 48 KiB and each row tile re-reads its int8 row. 48 KiB needs no
+/// opt-in on the driver.
+pub struct W8aPlan {
+    /// Warps in the block. Each warp owns one output column.
+    pub warps: u32,
+    /// K elements stored for each of the [`W8A_ROW_TILE`] staged activation rows.
+    pub bk: usize,
+    /// Bytes reserved for the staged int8 rows. Zero when they do not fit.
+    pub weight_bytes: u32,
+    /// Dynamic shared memory for the weight rows plus the activation tile.
+    pub shared_mem_bytes: u32,
+}
+
+/// Shared-memory tile for an INT8 GEMM whose reduction length is `k`.
+///
+/// `None` when `k` is zero. Every positive `k` fits, because K is tiled.
+#[must_use]
+pub fn w8a_plan(k: usize) -> Option<W8aPlan> {
+    if k == 0 {
+        return None;
+    }
+    let x_elem = W8A_ROW_TILE * std::mem::size_of::<f32>();
+    let max_bk = W8A_SMEM_LIMIT / x_elem;
+    if max_bk == 0 {
+        return None;
+    }
+    let packed = (W8A_WARPS as usize)
+        .checked_mul(k)?
+        .div_ceil(16)
+        .checked_mul(16)?;
+    let (weight_bytes, bk) = if packed < W8A_SMEM_LIMIT {
+        let remain = W8A_SMEM_LIMIT - packed;
+        let fit = remain / x_elem;
+        if fit == 0 {
+            (0, k.min(max_bk))
+        } else {
+            (packed, k.min(fit))
+        }
+    } else {
+        (0, k.min(max_bk))
+    };
+    let x_bytes = W8A_ROW_TILE * bk * std::mem::size_of::<f32>();
+    let total = weight_bytes + x_bytes;
+    if bk == 0 || total > W8A_SMEM_LIMIT {
+        return None;
+    }
+    Some(W8aPlan {
+        warps: W8A_WARPS,
+        bk,
+        weight_bytes: u32::try_from(weight_bytes).ok()?,
+        shared_mem_bytes: u32::try_from(total).ok()?,
+    })
+}
+
 /// Failure from the driver, cuBLAS, or a launch the host refused.
 #[derive(Debug)]
 pub struct CudaError {
@@ -298,6 +369,9 @@ pub struct Device {
     w8a_gemv_f32: CudaFunction,
     w8a_gemv_bf16: CudaFunction,
     w8a_gemv_bf16_f32: CudaFunction,
+    w8a_gemm_f32: CudaFunction,
+    w8a_gemm_bf16: CudaFunction,
+    w8a_gemm_bf16_f32: CudaFunction,
     dequant_i8_f32: CudaFunction,
     dequant_i8_bf16: CudaFunction,
     embed_i8_f32: CudaFunction,
@@ -344,7 +418,8 @@ fn set_cublas_workspace(
 impl Drop for Device {
     fn drop(&mut self) {
         // The cuBLAS handle is destroyed with the device. Wait so an in-flight
-        // GEMM cannot outlive the workspace it reads.
+        // GEMM cannot outlive the workspace it reads. A model that captured
+        // graphs destroys those graphs before this drop runs.
         let _ = self.stream.synchronize();
     }
 }
@@ -412,11 +487,20 @@ impl Device {
             w8a_gemv_f32: function(&module, "flint_w8a_gemv_f32")?,
             w8a_gemv_bf16: function(&module, "flint_w8a_gemv_bf16")?,
             w8a_gemv_bf16_f32: function(&module, "flint_w8a_gemv_bf16_f32")?,
+            w8a_gemm_f32: function(&module, "flint_w8a_gemm_f32")?,
+            w8a_gemm_bf16: function(&module, "flint_w8a_gemm_bf16")?,
+            w8a_gemm_bf16_f32: function(&module, "flint_w8a_gemm_bf16_f32")?,
             dequant_i8_f32: function(&module, "flint_dequant_i8_f32")?,
             dequant_i8_bf16: function(&module, "flint_dequant_i8_bf16")?,
             embed_i8_f32: function(&module, "flint_embed_i8_f32")?,
             embed_i8_bf16: function(&module, "flint_embed_i8_bf16")?,
         })
+    }
+
+    /// Wait until this device's stream is idle. Binds the context on this thread.
+    pub fn synchronize(&self) -> Result<(), CudaError> {
+        self.stream.synchronize()?;
+        Ok(())
     }
 
     /// Tensor-core math for the bf16 path. f32 parity stays on pedantic SGEMM.
@@ -1752,6 +1836,149 @@ impl Device {
         Ok(())
     }
 
+    /// Weight-stationary INT8 GEMM. `Y = X @ dequant(Q).T` with f32 activations.
+    ///
+    /// Batches wider than [`W8A_ROW_TILE`] use this instead of the GEMV. The
+    /// int8 row is read once per output column and an 8-row activation tile is
+    /// staged in shared memory.
+    #[allow(clippy::too_many_arguments)]
+    pub fn w8a_gemm_f32(
+        &self,
+        y: &mut F32Buf,
+        x: &F32Buf,
+        q: &I8Buf,
+        scales: &F32Buf,
+        rows: usize,
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 || out_features == 0 {
+            return Ok(());
+        }
+        let mut y_v = y.view_mut(rows * out_features)?;
+        let x_v = x.view(rows * in_features)?;
+        let q_v = q.view(out_features * in_features)?;
+        let s_v = scales.view(out_features)?;
+        self.launch_w8a(
+            &self.w8a_gemm_f32,
+            &mut y_v,
+            &x_v,
+            &q_v,
+            &s_v,
+            rows,
+            out_features,
+            in_features,
+        )
+    }
+
+    /// Weight-stationary INT8 GEMM with bf16 activations and a bf16 result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn w8a_gemm_bf16(
+        &self,
+        y: &mut Bf16Buf,
+        x: &Bf16Buf,
+        q: &I8Buf,
+        scales: &F32Buf,
+        rows: usize,
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 || out_features == 0 {
+            return Ok(());
+        }
+        let mut y_v = y.view_mut(rows * out_features)?;
+        let x_v = x.view(rows * in_features)?;
+        let q_v = q.view(out_features * in_features)?;
+        let s_v = scales.view(out_features)?;
+        self.launch_w8a(
+            &self.w8a_gemm_bf16,
+            &mut y_v,
+            &x_v,
+            &q_v,
+            &s_v,
+            rows,
+            out_features,
+            in_features,
+        )
+    }
+
+    /// Weight-stationary INT8 GEMM with bf16 activations and an f32 result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn w8a_gemm_bf16_f32(
+        &self,
+        y: &mut F32Buf,
+        x: &Bf16Buf,
+        q: &I8Buf,
+        scales: &F32Buf,
+        rows: usize,
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<(), CudaError> {
+        if rows == 0 || out_features == 0 {
+            return Ok(());
+        }
+        let mut y_v = y.view_mut(rows * out_features)?;
+        let x_v = x.view(rows * in_features)?;
+        let q_v = q.view(out_features * in_features)?;
+        let s_v = scales.view(out_features)?;
+        self.launch_w8a(
+            &self.w8a_gemm_bf16_f32,
+            &mut y_v,
+            &x_v,
+            &q_v,
+            &s_v,
+            rows,
+            out_features,
+            in_features,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_w8a<Y, X>(
+        &self,
+        func: &CudaFunction,
+        y: &mut CudaViewMut<'_, Y>,
+        x: &CudaView<'_, X>,
+        q: &CudaView<'_, i8>,
+        scales: &CudaView<'_, f32>,
+        rows: usize,
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<(), CudaError> {
+        let plan = w8a_plan(in_features).ok_or_else(|| {
+            CudaError::new(format!(
+                "INT8 weight-stationary GEMM has no tile for k={in_features}"
+            ))
+        })?;
+        let rows_i = as_i32(rows, "w8a rows")?;
+        let n_i = as_i32(out_features, "w8a n")?;
+        let k_i = as_i32(in_features, "w8a k")?;
+        let bk_i = as_i32(plan.bk, "w8a bk")?;
+        let w_i = as_i32(plan.weight_bytes as usize, "w8a weights")?;
+        let grid = u32::try_from(out_features.div_ceil(plan.warps as usize))
+            .map_err(|_| CudaError::new(format!("w8a grid for n={out_features} exceeds u32")))?;
+        let cfg = LaunchConfig {
+            grid_dim: (grid.max(1), 1, 1),
+            block_dim: (32, plan.warps, 1),
+            shared_mem_bytes: plan.shared_mem_bytes,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(func)
+                .arg(y)
+                .arg(x)
+                .arg(q)
+                .arg(scales)
+                .arg(&rows_i)
+                .arg(&n_i)
+                .arg(&k_i)
+                .arg(&bk_i)
+                .arg(&w_i)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
     /// Dequantize output rows `[src_row, src_row+rows)` into a contiguous f32 tile.
     #[allow(clippy::too_many_arguments)]
     pub fn dequant_i8_f32(
@@ -2298,6 +2525,9 @@ mod tests {
             "flint_w8a_gemv_f32",
             "flint_w8a_gemv_bf16",
             "flint_w8a_gemv_bf16_f32",
+            "flint_w8a_gemm_f32",
+            "flint_w8a_gemm_bf16",
+            "flint_w8a_gemm_bf16_f32",
             "flint_dequant_i8_f32",
             "flint_dequant_i8_bf16",
             "flint_embed_i8_f32",
@@ -2322,6 +2552,33 @@ mod tests {
             max <= tol,
             "max abs diff {max} > {tol}\ngot={got:?}\nexpect={expect:?}"
         );
+    }
+
+    #[test]
+    fn w8a_plan_covers_qwen_widths_inside_48kib() {
+        let hidden = w8a_plan(896).expect("hidden");
+        assert_eq!(hidden.warps, 8);
+        // The int8 rows fit, so K is staged once and the activation tile is the full row.
+        assert!(hidden.weight_bytes >= 8 * 896);
+        assert_eq!(hidden.bk, 896);
+        assert!(hidden.shared_mem_bytes as usize <= super::W8A_SMEM_LIMIT);
+
+        // Down-projection K still fits as int8, but not beside a full f32 activation tile.
+        let down = w8a_plan(4864).expect("down");
+        assert!(down.weight_bytes > 0);
+        assert!(down.bk < 4864);
+        assert_eq!(
+            down.shared_mem_bytes,
+            down.weight_bytes + (W8A_ROW_TILE * down.bk * 4) as u32
+        );
+        assert!(down.shared_mem_bytes as usize <= super::W8A_SMEM_LIMIT);
+
+        // A row that does not fit is left in global memory and the activation tile takes the budget.
+        let wide = w8a_plan(8_000).expect("wide");
+        assert_eq!(wide.weight_bytes, 0);
+        assert!(wide.bk < 8_000);
+        assert_eq!(wide.shared_mem_bytes, (W8A_ROW_TILE * wide.bk * 4) as u32);
+        assert!(w8a_plan(0).is_none());
     }
 
     #[test]
